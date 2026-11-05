@@ -198,7 +198,9 @@ jobs:
 
           if (-not $tunnelUrl) {
             Remove-Item "C:\logs\bore.log","C:\logs\bore_err.log" -Force -ErrorAction SilentlyContinue
-            Start-Process -FilePath "C:\Windows\System32\bore.exe" -ArgumentList "local 3389 --to bore.pub" -WindowStyle Hidden -RedirectStandardOutput "C:\logs\bore.log" -RedirectStandardError "C:\logs\bore_err.log"
+            Set-Content -Path "C:\run_bore.cmd" -Value '@echo off`r`nC:\Windows\System32\bore.exe local 3389 --to bore.pub > C:\logs\bore.log 2>&1' -Encoding ascii
+            schtasks /Create /TN "VexorBoreTunnel" /TR "C:\run_bore.cmd" /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F | Out-Null
+            schtasks /Run /TN "VexorBoreTunnel" | Out-Null
             for ($i = 0; $i -lt 20; $i++) {
               Start-Sleep -Seconds 2
               $logTxt = ""
@@ -532,7 +534,7 @@ jobs:
               if (-not (Get-Process -Name "bore" -ErrorAction SilentlyContinue)) {
                 Write-Output "[!] Bore tunnel down at $([Math]::Round($elapsed,1))m — restarting..."
                 Remove-Item "C:\logs\bore.log","C:\logs\bore_err.log" -Force -ErrorAction SilentlyContinue
-                Start-Process -FilePath "C:\Windows\System32\bore.exe" -ArgumentList "local 3389 --to bore.pub" -WindowStyle Hidden -RedirectStandardOutput "C:\logs\bore.log" -RedirectStandardError "C:\logs\bore_err.log"
+                schtasks /Run /TN "VexorBoreTunnel" | Out-Null
                 for ($i = 0; $i -lt 15; $i++) {
                   Start-Sleep -Seconds 2
                   $logTxt = ""
@@ -1033,7 +1035,7 @@ jobs:
           fi
 
           if [ -z "$tunnel_url" ]; then
-            nohup bore local "$port" --to bore.pub > /tmp/bore.log 2>&1 &
+            RUNNER_TRACKING_ID="" setsid nohup bore local "$port" --to bore.pub </dev/null >/tmp/bore.log 2>&1 &
             for i in $(seq 1 20); do
               sleep 2
               tunnel_url=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log 2>/dev/null | head -n1)
