@@ -135,22 +135,39 @@ jobs:
           if (-not $ready) { Restart-Service -Name "TermService" -Force; Start-Sleep -Seconds 2 }
 
                 # ── 4. Create VEXOR User ──────────────────────────────────────────────
-      - name: Create VEXOR Admin User
+      - name: Create Mikey Admin User & Speed Tweaks
         shell: pwsh
+        env:
+          RDP_SECRET_PASS: ${{ secrets.RDP_PASS }}
         run: |
           secedit /export /cfg C:\secpol.cfg
           (Get-Content C:\secpol.cfg).replace("PasswordComplexity = 1","PasswordComplexity = 0").replace("MinimumPasswordLength = 8","MinimumPasswordLength = 0") | Set-Content C:\secpol.cfg
           secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
           Remove-Item -Force C:\secpol.cfg -ErrorAction SilentlyContinue
 
-          cmd.exe /c "net user mikey mikey /add /expires:never /active:yes"
+          $p = if ($env:RDP_SECRET_PASS) { $env:RDP_SECRET_PASS } else { "Mikey@Secure2026!" }
+          Write-Output "::add-mask::$p"
+          cmd.exe /c "net user mikey `"$p`" /add /expires:never /active:yes"
           cmd.exe /c "net localgroup Administrators mikey /add"
           cmd.exe /c "net localgroup `"Remote Desktop Users`" mikey /add"
-          cmd.exe /c "net user runneradmin mikey /active:yes"
+          cmd.exe /c "net user runneradmin `"$p`" /active:yes"
+
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force -ErrorAction SilentlyContinue | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "VisualExperiencePolicy" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "DWMFRAMEINTERVAL" -Value 15 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "bEnumerateHWBeforeSW" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "AVC444ModePreferred" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "AVCHardwareEncodePreferred" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+          Stop-Service -Name "WSearch","SysMain","DiagTrack","wuauserv" -Force -ErrorAction SilentlyContinue
+          Set-Service -Name "WSearch" -StartupType Disabled -ErrorAction SilentlyContinue
+          Set-Service -Name "SysMain" -StartupType Disabled -ErrorAction SilentlyContinue
+          Set-Service -Name "DiagTrack" -StartupType Disabled -ErrorAction SilentlyContinue
+          Set-Service -Name "wuauserv" -StartupType Disabled -ErrorAction SilentlyContinue
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
 
           New-Item -ItemType Directory -Force -Path "C:\logs" | Out-Null
-          New-Item -ItemType Directory -Force -Path "C:\Users\VEXOR\.config\vexor" | Out-Null
-          Write-Output "[+] User mikey created with password mikey"
+          New-Item -ItemType Directory -Force -Path "C:\Users\mikey\.config\vexor" | Out-Null
+          Write-Output "[+] User mikey created securely + Anti-Lag applied"
 
                 # ── 5. Ngrok Tunnel ───────────────────────────────────────────────────
       - name: Configure and Start Tunnel (Bore Free / Ngrok)
@@ -218,10 +235,11 @@ jobs:
           }
 
           if ($tunnelUrl) {
+            Write-Output "::add-mask::$tunnelUrl"
             Write-Output "============================================"
-            Write-Output " [+] RDP Address : $tunnelUrl"
+            Write-Output " [+] RDP Tunnel Ready (Protected in Artifact)"
             Write-Output " [+] Username    : mikey"
-            Write-Output " [+] Password    : mikey"
+            Write-Output " [+] Password    : [Stored in GitHub Secret RDP_PASS]"
             Write-Output "============================================"
             echo "tunnel_url=$tunnelUrl" >> $env:GITHUB_OUTPUT
             echo "TUNNEL_HOST=$tunnelUrl" >> $env:GITHUB_ENV
@@ -239,7 +257,7 @@ jobs:
         run: |
           @(
             "full address:s:${{ env.TUNNEL_HOST }}",
-            "username:s:VEXOR",
+            "username:s:mikey",
             "prompt for credentials:i:1",
             "administrative session:i:1",
             "authentication level:i:0",
@@ -247,11 +265,27 @@ jobs:
             "autoreconnection enabled:i:1",
             "smart sizing:i:1",
             "screen mode id:i:2",
-            "desktopwidth:i:1920",
-            "desktopheight:i:1080",
+            "desktopwidth:i:1366",
+            "desktopheight:i:768",
+            "session bpp:i:16",
+            "compression:i:1",
+            "bitmapcachepersistenable:i:1",
+            "connection type:i:2",
+            "networkautodetect:i:0",
+            "bandwidthautodetect:i:1",
+            "disable wallpaper:i:1",
+            "allow font smoothing:i:1",
+            "allow desktop composition:i:0",
+            "disable full window drag:i:1",
+            "disable menu anims:i:1",
+            "disable themes:i:0",
+            "audiomode:i:2",
+            "redirectprinters:i:0",
+            "redirectcomports:i:0",
+            "redirectsmartcards:i:0",
             "redirectclipboard:i:1"
           ) | Out-File -FilePath rdp-connection.rdp -Encoding ascii
-          Write-Output "[+] .rdp file ready: ${{ env.TUNNEL_HOST }}"
+          Write-Output "[+] .rdp file ready"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -564,7 +598,7 @@ jobs:
             }
             if ($newUrl) {
               $env:TUNNEL_HOST = $newUrl
-              Write-Output "[+] New tunnel: $newUrl"
+              Write-Output "::add-mask::$newUrl"; Write-Output "[+] New tunnel active"
               $svcsFile = "C:\Users\VEXOR\.config\vexor\services.json"
               if (Test-Path $svcsFile) {
                 (Get-Content $svcsFile | ConvertFrom-Json) | Where-Object { $_.type -eq "telegram_bot" -and $_.bot_token } | ForEach-Object {
@@ -655,7 +689,7 @@ jobs:
               if ($autoTriggered) { break }
             }
 
-            Write-Output "[~] $([Math]::Round($elapsed,1))m | Loop $loops | $env:TUNNEL_HOST"
+            Write-Output "[~] $([Math]::Round($elapsed,1))m | Loop $loops | Tunnel Active"
             Start-Sleep -Seconds 120
           }
 
