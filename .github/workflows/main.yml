@@ -69,14 +69,20 @@ jobs:
       contents: read
 
     steps:
-      # ── 1. Ngrok ─────────────────────────────────────────────────────────
-      - name: Download and extract Ngrok v3
+      # ── 1. Bore + Ngrok ──────────────────────────────────────────────────
+      - name: Download Bore and Ngrok
         shell: pwsh
         run: |
-          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
-          Expand-Archive ngrok.zip -DestinationPath .
-          Remove-Item ngrok.zip
-          Copy-Item .\ngrok.exe C:\Windows\System32\ngrok.exe -Force
+          Invoke-WebRequest "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip" -OutFile bore.zip
+          Expand-Archive bore.zip -DestinationPath . -Force
+          Remove-Item bore.zip
+          Copy-Item .\bore.exe C:\Windows\System32\bore.exe -Force
+          try {
+            Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
+            Expand-Archive ngrok.zip -DestinationPath . -Force
+            Remove-Item ngrok.zip
+            Copy-Item .\ngrok.exe C:\Windows\System32\ngrok.exe -Force
+          } catch {}
 
                 # ── 2. RAM / Disk ────────────────────────────────────────────────────
       - name: Optimize Disk and Configure RAM
@@ -143,58 +149,82 @@ jobs:
           Write-Output "[+] User VEXOR created with password VEXOR@2026"
 
                 # ── 5. Ngrok Tunnel ───────────────────────────────────────────────────
-      - name: Configure and Start Ngrok Tunnel
+      - name: Configure and Start Tunnel (Bore Free / Ngrok)
         id: ngrok-tunnel
         shell: pwsh
         env:
           DEFAULT_NGROK: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
+          $tunnelUrl = $null
+          $tunnelType = "bore"
           $tok = "${{ inputs.ngrok_token }}".Trim()
           if (-not $tok) { $tok = "$env:DEFAULT_NGROK".Trim() }
-          if (-not $tok) {
-            Write-Output "[!] ERROR: Ngrok Auth Token is empty! Please set the NGROK_AUTH_TOKEN repository secret or pass ngrok_token in Run workflow."
-            exit 1
-          }
           $reg = "${{ inputs.ngrok_region }}".Trim()
           if (-not $reg -or $reg -eq "gb") { $reg = "eu" }
 
-          @(
-            'version: "2"',
-            "authtoken: $tok",
-            "region: $reg",
-            'web_addr: 127.0.0.1:4040',
-            'log: C:\logs\ngrok.log',
-            'tunnels:',
-            '  rdp:',
-            '    proto: tcp',
-            '    addr: 127.0.0.1:3389'
-          ) | Out-File -FilePath "C:\ngrok.yml" -Encoding ascii
+          if ($tok -and (Test-Path "C:\Windows\System32\ngrok.exe")) {
+            @(
+              'version: "2"',
+              "authtoken: $tok",
+              "region: $reg",
+              'web_addr: 127.0.0.1:4040',
+              'log: C:\logs\ngrok.log',
+              'tunnels:',
+              '  rdp:',
+              '    proto: tcp',
+              '    addr: 127.0.0.1:3389'
+            ) | Out-File -FilePath "C:\ngrok.yml" -Encoding ascii
 
-          C:\Windows\System32\ngrok.exe service install --config="C:\ngrok.yml"
-          C:\Windows\System32\ngrok.exe service start
-
-          $tunnelUrl = $null
-          $timeout = 30
-          while ($timeout -gt 0 -and -not $tunnelUrl) {
-            Start-Sleep -Seconds 2
             try {
-              $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
-              $tcp = $response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
-              if ($tcp) { $tunnelUrl = $tcp.public_url -replace "^tcp://", "" }
+              C:\Windows\System32\ngrok.exe service install --config="C:\ngrok.yml"
+              C:\Windows\System32\ngrok.exe service start
+              $timeout = 8
+              while ($timeout -gt 0 -and -not $tunnelUrl) {
+                Start-Sleep -Seconds 2
+                try {
+                  $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+                  $tcp = $response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+                  if ($tcp) { $tunnelUrl = $tcp.public_url -replace "^tcp://", ""; $tunnelType = "ngrok" }
+                } catch {}
+                if ((Test-Path "C:\logs\ngrok.log") -and ((Get-Content "C:\logs\ngrok.log" -Raw) -match "ERR_NGROK_")) { break }
+                $timeout--
+              }
             } catch {}
-            $timeout--
+            if (-not $tunnelUrl) {
+              Write-Output "[*] Ngrok unavailable or requires card — switching to free Bore TCP tunnel..."
+              try { C:\Windows\System32\ngrok.exe service stop 2>$null; C:\Windows\System32\ngrok.exe service uninstall 2>$null } catch {}
+            }
+          }
+
+          if (-not $tunnelUrl) {
+            Remove-Item "C:\logs\bore.log","C:\logs\bore_err.log" -Force -ErrorAction SilentlyContinue
+            Start-Process -FilePath "C:\Windows\System32\bore.exe" -ArgumentList "local 3389 --to bore.pub" -WindowStyle Hidden -RedirectStandardOutput "C:\logs\bore.log" -RedirectStandardError "C:\logs\bore_err.log"
+            for ($i = 0; $i -lt 20; $i++) {
+              Start-Sleep -Seconds 2
+              $logTxt = ""
+              if (Test-Path "C:\logs\bore.log") { $logTxt += (Get-Content "C:\logs\bore.log" -Raw -ErrorAction SilentlyContinue) }
+              if (Test-Path "C:\logs\bore_err.log") { $logTxt += (Get-Content "C:\logs\bore_err.log" -Raw -ErrorAction SilentlyContinue) }
+              if ($logTxt -match "(bore\.pub:\d+)") {
+                $tunnelUrl = $Matches[1]
+                $tunnelType = "bore"
+                break
+              }
+            }
           }
 
           if ($tunnelUrl) {
-            Write-Output "[+] RDP Public: $tunnelUrl"
+            Write-Output "============================================"
+            Write-Output " [+] RDP Address : $tunnelUrl"
+            Write-Output " [+] Username    : VEXOR"
+            Write-Output " [+] Password    : VEXOR@2026"
+            Write-Output "============================================"
             echo "tunnel_url=$tunnelUrl" >> $env:GITHUB_OUTPUT
             echo "TUNNEL_HOST=$tunnelUrl" >> $env:GITHUB_ENV
+            echo "TUNNEL_TYPE=$tunnelType" >> $env:GITHUB_ENV
           } else {
             Write-Output "[!] Failed to get tunnel URL"
-            if (Test-Path "C:\logs\ngrok.log") {
-              Write-Output "--- Ngrok Log ---"
-              Get-Content "C:\logs\ngrok.log" -Tail 40
-            }
+            if (Test-Path "C:\logs\bore.log") { Get-Content "C:\logs\bore.log" }
+            if (Test-Path "C:\logs\bore_err.log") { Get-Content "C:\logs\bore_err.log" }
             exit 1
           }
 
@@ -496,37 +526,50 @@ jobs:
             $elapsed = ((Get-Date) - $start).TotalMinutes
             $loops++
 
-            # ── Ngrok service watchdog ──────────────────────────────────────
-            $svc = Get-Service -Name "ngrok" -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -ne "Running") {
-              Write-Output "[!] Ngrok down at $([Math]::Round($elapsed,1))m — restarting..."
-              Start-Service -Name "ngrok" -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds 5
-
-              # Get new URL and re-update webhooks
-              $newUrl = $null
-              for ($i = 0; $i -lt 15; $i++) {
-                try {
-                  $r = Invoke-RestMethod "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
-                  $t = $r.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
-                  if ($t) { $newUrl = $t.public_url -replace "^tcp://",""; break }
-                } catch {}
-                Start-Sleep -Seconds 2
+            # ── Tunnel service watchdog (Bore / Ngrok) ──────────────────────
+            $newUrl = $null
+            if ($env:TUNNEL_TYPE -eq "bore") {
+              if (-not (Get-Process -Name "bore" -ErrorAction SilentlyContinue)) {
+                Write-Output "[!] Bore tunnel down at $([Math]::Round($elapsed,1))m — restarting..."
+                Remove-Item "C:\logs\bore.log","C:\logs\bore_err.log" -Force -ErrorAction SilentlyContinue
+                Start-Process -FilePath "C:\Windows\System32\bore.exe" -ArgumentList "local 3389 --to bore.pub" -WindowStyle Hidden -RedirectStandardOutput "C:\logs\bore.log" -RedirectStandardError "C:\logs\bore_err.log"
+                for ($i = 0; $i -lt 15; $i++) {
+                  Start-Sleep -Seconds 2
+                  $logTxt = ""
+                  if (Test-Path "C:\logs\bore.log") { $logTxt += (Get-Content "C:\logs\bore.log" -Raw -ErrorAction SilentlyContinue) }
+                  if (Test-Path "C:\logs\bore_err.log") { $logTxt += (Get-Content "C:\logs\bore_err.log" -Raw -ErrorAction SilentlyContinue) }
+                  if ($logTxt -match "(bore\.pub:\d+)") { $newUrl = $Matches[1]; break }
+                }
               }
-              if ($newUrl) {
-                $env:TUNNEL_HOST = $newUrl
-                Write-Output "[+] New tunnel: $newUrl"
-                $svcsFile = "C:\Users\VEXOR\.config\vexor\services.json"
-                if (Test-Path $svcsFile) {
-                  (Get-Content $svcsFile | ConvertFrom-Json) | Where-Object { $_.type -eq "telegram_bot" -and $_.bot_token } | ForEach-Object {
-                    $wpath = if ($_.webhook_path) { $_.webhook_path } else { "/webhook" }
-                    try {
-                      Invoke-RestMethod "https://api.telegram.org/bot$($_.bot_token)/setWebhook" `
-                        -Method Post -Body (@{url="https://$newUrl$wpath"} | ConvertTo-Json) `
-                        -ContentType "application/json" | Out-Null
-                      Write-Output "[+] Webhook re-updated for $($_.name)"
-                    } catch {}
-                  }
+            } else {
+              $svc = Get-Service -Name "ngrok" -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -ne "Running") {
+                Write-Output "[!] Ngrok down at $([Math]::Round($elapsed,1))m — restarting..."
+                Start-Service -Name "ngrok" -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 5
+                for ($i = 0; $i -lt 15; $i++) {
+                  try {
+                    $r = Invoke-RestMethod "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+                    $t = $r.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+                    if ($t) { $newUrl = $t.public_url -replace "^tcp://",""; break }
+                  } catch {}
+                  Start-Sleep -Seconds 2
+                }
+              }
+            }
+            if ($newUrl) {
+              $env:TUNNEL_HOST = $newUrl
+              Write-Output "[+] New tunnel: $newUrl"
+              $svcsFile = "C:\Users\VEXOR\.config\vexor\services.json"
+              if (Test-Path $svcsFile) {
+                (Get-Content $svcsFile | ConvertFrom-Json) | Where-Object { $_.type -eq "telegram_bot" -and $_.bot_token } | ForEach-Object {
+                  $wpath = if ($_.webhook_path) { $_.webhook_path } else { "/webhook" }
+                  try {
+                    Invoke-RestMethod "https://api.telegram.org/bot$($_.bot_token)/setWebhook" `
+                      -Method Post -Body (@{url="https://$newUrl$wpath"} | ConvertTo-Json) `
+                      -ContentType "application/json" | Out-Null
+                    Write-Output "[+] Webhook re-updated for $($_.name)"
+                  } catch {}
                 }
               }
             }
@@ -654,6 +697,7 @@ jobs:
               Write-Output "[+] Fallback: next session triggered from cleanup."
             } catch {}
           }
+          try { Stop-Process -Name "bore" -Force -ErrorAction SilentlyContinue } catch {}
           try { C:\Windows\System32\ngrok.exe service stop } catch {}
           try { C:\Windows\System32\ngrok.exe service uninstall } catch {}
 
@@ -956,37 +1000,54 @@ jobs:
           echo "[+] OpenCode AI + REA ready on Linux"
 
                 # ── 7. Ngrok Tunnel (Linux) ───────────────────────────────────────────
-      - name: Configure and Start Ngrok Tunnel
+      - name: Configure and Start Tunnel (Bore Free / Ngrok)
         id: ngrok-tunnel
         run: |
-          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz
-          sudo mv ngrok /usr/local/bin/ngrok
+          curl -sSL https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz | tar xz
+          sudo mv bore /usr/local/bin/bore
+          sudo chmod +x /usr/local/bin/bore
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz 2>/dev/null && sudo mv ngrok /usr/local/bin/ngrok || true
 
           tok="${{ inputs.ngrok_token }}"
           if [ -z "$tok" ]; then tok="${{ secrets.NGROK_AUTH_TOKEN }}"; fi
-          if [ -z "$tok" ]; then
-            echo "[!] ERROR: Ngrok Auth Token is empty! Please set NGROK_AUTH_TOKEN secret or pass ngrok_token input."
-            exit 1
-          fi
           reg="${{ inputs.ngrok_region }}"
           if [ -z "$reg" ] || [ "$reg" = "gb" ]; then reg="eu"; fi
           port="${{ env.TARGET_PORT }}"
           if [ -z "$port" ]; then port=22; fi
 
-          nohup ngrok tcp "$port" --authtoken "$tok" --region "$reg" --log=stdout > /tmp/ngrok.log 2>&1 &
-          sleep 3
           tunnel_url=""
-          for i in $(seq 1 25); do
-            tunnel_url=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o 'tcp://[^"]*' | head -n1 | sed 's|tcp://||')
-            if [ -n "$tunnel_url" ]; then break; fi
-            sleep 2
-          done
+          tunnel_type="bore"
+          if [ -n "$tok" ] && command -v ngrok >/dev/null 2>&1; then
+            nohup ngrok tcp "$port" --authtoken "$tok" --region "$reg" --log=stdout > /tmp/ngrok.log 2>&1 &
+            for i in $(seq 1 8); do
+              sleep 2
+              tunnel_url=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o 'tcp://[^"]*' | head -n1 | sed 's|tcp://||')
+              if [ -n "$tunnel_url" ]; then tunnel_type="ngrok"; break; fi
+              if grep -q "ERR_NGROK_" /tmp/ngrok.log 2>/dev/null; then break; fi
+            done
+            if [ -z "$tunnel_url" ]; then
+              echo "[*] Ngrok unavailable or requires card — switching to free Bore TCP tunnel..."
+              pkill bore 2>/dev/null || true
+          pkill ngrok 2>/dev/null || true
+            fi
+          fi
+
+          if [ -z "$tunnel_url" ]; then
+            nohup bore local "$port" --to bore.pub > /tmp/bore.log 2>&1 &
+            for i in $(seq 1 20); do
+              sleep 2
+              tunnel_url=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log 2>/dev/null | head -n1)
+              if [ -n "$tunnel_url" ]; then tunnel_type="bore"; break; fi
+            done
+          fi
+
           if [ -n "$tunnel_url" ]; then
             echo "tunnel_url=$tunnel_url" >> $GITHUB_OUTPUT
             echo "TUNNEL_HOST=$tunnel_url" >> $GITHUB_ENV
-            echo "[+] Tunnel: $tunnel_url"
+            echo "TUNNEL_TYPE=$tunnel_type" >> $GITHUB_ENV
+            echo "[+] Tunnel ($tunnel_type): $tunnel_url"
           else
-            cat /tmp/ngrok.log
+            cat /tmp/bore.log 2>/dev/null || true
             exit 1
           fi
 
@@ -1208,18 +1269,27 @@ jobs:
             ELAPSED=$(( (NOW - START) / 60 ))
             LOOPS=$((LOOPS + 1))
 
-            # ── Ngrok watchdog ──────────────────────────────────────────────
-            if ! pgrep -x "ngrok" > /dev/null; then
+            # ── Tunnel watchdog (Bore / Ngrok) ─────────────────────────────
+            NEW_URL=""
+            if [ "${{ env.TUNNEL_TYPE }}" = "bore" ]; then
+              if ! pgrep -x "bore" > /dev/null; then
+                echo "[!] Bore down at ${ELAPSED}m — restarting..."
+                nohup bore local "$PORT" --to bore.pub > /tmp/bore.log 2>&1 &
+                sleep 4
+                NEW_URL=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log 2>/dev/null | head -n1)
+              fi
+            elif ! pgrep -x "ngrok" > /dev/null; then
               echo "[!] Ngrok down at ${ELAPSED}m — restarting..."
               nohup ngrok tcp "$PORT" --region "$REG" --log=stdout > /tmp/ngrok.log 2>&1 &
               sleep 5
               NEW_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o 'tcp://[^"]*' | head -n1 | sed 's|tcp://||')
-              if [ -n "$NEW_URL" ]; then
-                TUNNEL_HOST="$NEW_URL"
-                echo "[+] New tunnel: $NEW_URL"
-                # Re-update Telegram webhooks
-                if [ -f "/home/runner/.config/vexor/services.json" ]; then
-                  python3 -c "
+            fi
+            if [ -n "$NEW_URL" ]; then
+              TUNNEL_HOST="$NEW_URL"
+              echo "[+] New tunnel: $NEW_URL"
+              # Re-update Telegram webhooks
+              if [ -f "/home/runner/.config/vexor/services.json" ]; then
+                python3 -c "
           import json, urllib.request
           with open('/home/runner/.config/vexor/services.json') as f: svcs = json.load(f)
           for s in svcs:
@@ -1234,7 +1304,6 @@ jobs:
                   except Exception as e:
             print(f\"[!] Webhook re-update failed: {e}\")
           " 2>/dev/null || true
-                fi
               fi
             fi
 
@@ -1367,4 +1436,5 @@ jobs:
               -d "$BODY" || true
             echo "[+] Fallback trigger sent from cleanup."
           fi
+          pkill bore 2>/dev/null || true
           pkill ngrok 2>/dev/null || true
