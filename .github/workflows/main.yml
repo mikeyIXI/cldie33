@@ -149,15 +149,21 @@ jobs:
         env:
           DEFAULT_NGROK: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          $tok = "${{ inputs.ngrok_token }}"
-          if (-not $tok) { $tok = $env:DEFAULT_NGROK }
-          $reg = "${{ inputs.ngrok_region }}"
+          $tok = "${{ inputs.ngrok_token }}".Trim()
+          if (-not $tok) { $tok = "$env:DEFAULT_NGROK".Trim() }
+          if (-not $tok) {
+            Write-Output "[!] ERROR: Ngrok Auth Token is empty! Please set the NGROK_AUTH_TOKEN repository secret or pass ngrok_token in Run workflow."
+            exit 1
+          }
+          $reg = "${{ inputs.ngrok_region }}".Trim()
           if (-not $reg -or $reg -eq "gb") { $reg = "eu" }
 
           @(
             'version: "2"',
             "authtoken: $tok",
             "region: $reg",
+            'web_addr: 127.0.0.1:4040',
+            'log: C:\logs\ngrok.log',
             'tunnels:',
             '  rdp:',
             '    proto: tcp',
@@ -185,6 +191,10 @@ jobs:
             echo "TUNNEL_HOST=$tunnelUrl" >> $env:GITHUB_ENV
           } else {
             Write-Output "[!] Failed to get tunnel URL"
+            if (Test-Path "C:\logs\ngrok.log") {
+              Write-Output "--- Ngrok Log ---"
+              Get-Content "C:\logs\ngrok.log" -Tail 40
+            }
             exit 1
           }
 
@@ -954,6 +964,10 @@ jobs:
 
           tok="${{ inputs.ngrok_token }}"
           if [ -z "$tok" ]; then tok="${{ secrets.NGROK_AUTH_TOKEN }}"; fi
+          if [ -z "$tok" ]; then
+            echo "[!] ERROR: Ngrok Auth Token is empty! Please set NGROK_AUTH_TOKEN secret or pass ngrok_token input."
+            exit 1
+          fi
           reg="${{ inputs.ngrok_region }}"
           if [ -z "$reg" ] || [ "$reg" = "gb" ]; then reg="eu"; fi
           port="${{ env.TARGET_PORT }}"
