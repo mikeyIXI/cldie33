@@ -141,16 +141,25 @@ jobs:
           RDP_SECRET_PASS: ${{ secrets.RDP_PASS }}
         run: |
           secedit /export /cfg C:\secpol.cfg
-          (Get-Content C:\secpol.cfg).replace("PasswordComplexity = 1","PasswordComplexity = 0").replace("MinimumPasswordLength = 8","MinimumPasswordLength = 0") | Set-Content C:\secpol.cfg
+          $cfg = Get-Content C:\secpol.cfg -Encoding Unicode
+          $cfg = $cfg -replace "PasswordComplexity = 1","PasswordComplexity = 0" -replace "MinimumPasswordLength = \d+","MinimumPasswordLength = 0"
+          $cfg | Set-Content C:\secpol.cfg -Encoding Unicode
           secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
           Remove-Item -Force C:\secpol.cfg -ErrorAction SilentlyContinue
 
-          $p = if ($env:RDP_SECRET_PASS) { $env:RDP_SECRET_PASS } else { "Mikey@Secure2026!" }
+          $p = if ($env:RDP_SECRET_PASS) { $env:RDP_SECRET_PASS.Trim() } else { "Vx9#kP4mZ2026" }
           Write-Output "::add-mask::$p"
-          cmd.exe /c "net user mikey `"$p`" /add /expires:never /active:yes"
-          cmd.exe /c "net localgroup Administrators mikey /add"
-          cmd.exe /c "net localgroup `"Remote Desktop Users`" mikey /add"
-          cmd.exe /c "net user runneradmin `"$p`" /active:yes"
+          $secPass = ConvertTo-SecureString $p -AsPlainText -Force
+          if (Get-LocalUser -Name "mikey" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "mikey" -Password $secPass -PasswordNeverExpires $true
+            Enable-LocalUser -Name "mikey"
+          } else {
+            New-LocalUser -Name "mikey" -Password $secPass -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "mikey" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "mikey" -ErrorAction SilentlyContinue
+          Set-LocalUser -Name "runneradmin" -Password $secPass -ErrorAction SilentlyContinue
+          Enable-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
 
           New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force -ErrorAction SilentlyContinue | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "VisualExperiencePolicy" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
