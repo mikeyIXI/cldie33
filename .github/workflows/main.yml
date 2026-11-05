@@ -1,0 +1,1356 @@
+name: VEXOR Cloud Server Runner
+
+# =============================================================================
+# services.json FORMAT (save to delta, gets restored every session)
+# Windows: C:\Users\VEXOR\.config\vexor\services.json
+# Linux:   /home/runner/.config/vexor/services.json
+#
+# [
+#   {
+#     "name": "my-telegram-bot",
+#     "type": "telegram_bot",
+#     "interpreter": "python3",
+#     "path": "C:\\Users\\VEXOR\\bots\\bot.py",
+#     "args": [],
+#     "working_dir": "C:\\Users\\VEXOR\\bots",
+#     "bot_token": "1234567890:ABCdef...",   <- webhook auto-update
+#     "webhook_path": "/webhook"
+#   },
+#   {
+#     "name": "node-api",
+#     "type": "node",
+#     "path": "C:\\Users\\VEXOR\\apps\\server.js",
+#     "args": ["--port", "3000"],
+#     "working_dir": "C:\\Users\\VEXOR\\apps"
+#   }
+# ]
+#
+# types: telegram_bot | telegram_bot_polling | python | node | process
+# telegram_bot      -> starts + auto-sets webhook to ngrok URL
+# telegram_bot_polling -> starts only (no webhook)
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_version:
+        description: 'Server OS (Windows or Linux Distros)'
+        required: false
+        default: 'windows-2022'
+      ram_size:
+        description: 'RAM Configuration'
+        required: false
+        default: '16GB'
+      ngrok_token:
+        description: 'Ngrok Auth Token'
+        required: false
+        default: ''
+      ngrok_region:
+        description: 'Ngrok Region'
+        required: false
+        default: 'eu'
+      chain_id:
+        description: 'Chain ID for Delta Backup (keeps state across sessions)'
+        required: false
+        default: ''
+      auto_restart:
+        description: 'Auto-restart new session when this one ends (infinite chain)'
+        required: false
+        default: 'true'
+
+# ─── WINDOWS RDP JOB ─────────────────────────────────────────────────────────
+jobs:
+  rdp-setup:
+    if: startsWith(github.event.inputs.windows_version, 'windows') || startsWith(github.event.inputs.windows_version, 'win') || github.event.inputs.windows_version == '' || github.event.inputs.windows_version == null
+    runs-on: ${{ (github.event.inputs.windows_version == 'windows-2025' || github.event.inputs.windows_version == 'win2025-ai') && 'windows-2025' || 'windows-2022' }}
+    timeout-minutes: 360
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      # ── 1. Ngrok ─────────────────────────────────────────────────────────
+      - name: Download and extract Ngrok v3
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath .
+          Remove-Item ngrok.zip
+          Copy-Item .\ngrok.exe C:\Windows\System32\ngrok.exe -Force
+
+                # ── 2. RAM / Disk ────────────────────────────────────────────────────
+      - name: Optimize Disk and Configure RAM
+        shell: pwsh
+        run: |
+          $ramChoice = "${{ inputs.ram_size }}"
+          if ($ramChoice -eq "32GB" -or $ramChoice -eq "64GB") {
+            $pageMB = if ($ramChoice -eq "64GB") { 57344 } else { 24576 }
+            try {
+              Set-CimInstance -Query "Select * from Win32_ComputerSystem" -Property @{AutomaticManagedPagefile = $false} -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name 'PagingFiles' -Value @("C:\pagefile.sys $pageMB $pageMB") -ErrorAction SilentlyContinue
+              Write-Output "[+] Pagefile set to $pageMB MB"
+            } catch {}
+          }
+          Start-Job { Remove-Item -Recurse -Force "C:\hostedtoolcache" -ErrorAction SilentlyContinue } | Out-Null
+          $freeGB = [Math]::Round((Get-PSDrive C).Free / 1GB, 1)
+          Write-Output "[+] Free disk: $freeGB GB"
+
+                # ── 3. RDP + Firewall ─────────────────────────────────────────────────
+      - name: Enable RDP and Firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 1 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fPromptForPassword" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "PortNumber" -Value 3389 -Force
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force -ErrorAction SilentlyContinue | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "fDisableUDP" -Value 1 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel" -Value 2 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters" -Name "BlockNTLM" -Value 0 -Force -ErrorAction SilentlyContinue
+          Set-Service -Name "TermService" -StartupType Automatic
+          Restart-Service -Name "TermService" -Force
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="Allow-RDP" dir=in action=allow protocol=TCP localport=3389
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-3389" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -ErrorAction SilentlyContinue
+          $ready = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            if ((Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded) {
+              Write-Output "[+] RDP listening on :3389"
+              $ready = $true; break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) { Restart-Service -Name "TermService" -Force; Start-Sleep -Seconds 2 }
+
+                # ── 4. Create VEXOR User ──────────────────────────────────────────────
+      - name: Create VEXOR Admin User
+        shell: pwsh
+        run: |
+          secedit /export /cfg C:\secpol.cfg
+          (Get-Content C:\secpol.cfg).replace("PasswordComplexity = 1","PasswordComplexity = 0").replace("MinimumPasswordLength = 8","MinimumPasswordLength = 0") | Set-Content C:\secpol.cfg
+          secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+          Remove-Item -Force C:\secpol.cfg -ErrorAction SilentlyContinue
+
+          cmd.exe /c "net user VEXOR VEXOR@2026 /add /expires:never /active:yes"
+          cmd.exe /c "net localgroup Administrators VEXOR /add"
+          cmd.exe /c "net localgroup `"Remote Desktop Users`" VEXOR /add"
+          cmd.exe /c "net user runneradmin VEXOR@2026 /active:yes"
+
+          New-Item -ItemType Directory -Force -Path "C:\logs" | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\Users\VEXOR\.config\vexor" | Out-Null
+          Write-Output "[+] User VEXOR created with password VEXOR@2026"
+
+                # ── 5. Ngrok Tunnel ───────────────────────────────────────────────────
+      - name: Configure and Start Ngrok Tunnel
+        id: ngrok-tunnel
+        shell: pwsh
+        env:
+          DEFAULT_NGROK: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          $tok = "${{ inputs.ngrok_token }}"
+          if (-not $tok) { $tok = $env:DEFAULT_NGROK }
+          $reg = "${{ inputs.ngrok_region }}"
+          if (-not $reg -or $reg -eq "gb") { $reg = "eu" }
+
+          @(
+            'version: "2"',
+            "authtoken: $tok",
+            "region: $reg",
+            'tunnels:',
+            '  rdp:',
+            '    proto: tcp',
+            '    addr: 127.0.0.1:3389'
+          ) | Out-File -FilePath "C:\ngrok.yml" -Encoding ascii
+
+          C:\Windows\System32\ngrok.exe service install --config="C:\ngrok.yml"
+          C:\Windows\System32\ngrok.exe service start
+
+          $tunnelUrl = $null
+          $timeout = 30
+          while ($timeout -gt 0 -and -not $tunnelUrl) {
+            Start-Sleep -Seconds 2
+            try {
+              $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+              $tcp = $response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+              if ($tcp) { $tunnelUrl = $tcp.public_url -replace "^tcp://", "" }
+            } catch {}
+            $timeout--
+          }
+
+          if ($tunnelUrl) {
+            Write-Output "[+] RDP Public: $tunnelUrl"
+            echo "tunnel_url=$tunnelUrl" >> $env:GITHUB_OUTPUT
+            echo "TUNNEL_HOST=$tunnelUrl" >> $env:GITHUB_ENV
+          } else {
+            Write-Output "[!] Failed to get tunnel URL"
+            exit 1
+          }
+
+                # ── 6. Build .rdp Artifact (bug fixed — no duplicate $url) ───────────
+      - name: Build and Upload .rdp Artifact
+        shell: pwsh
+        run: |
+          @(
+            "full address:s:${{ env.TUNNEL_HOST }}",
+            "username:s:VEXOR",
+            "prompt for credentials:i:1",
+            "administrative session:i:1",
+            "authentication level:i:0",
+            "enablecredsspsupport:i:0",
+            "autoreconnection enabled:i:1",
+            "smart sizing:i:1",
+            "screen mode id:i:2",
+            "desktopwidth:i:1920",
+            "desktopheight:i:1080",
+            "redirectclipboard:i:1"
+          ) | Out-File -FilePath rdp-connection.rdp -Encoding ascii
+          Write-Output "[+] .rdp file ready: ${{ env.TUNNEL_HOST }}"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection
+          path: rdp-connection.rdp
+          retention-days: 1
+
+      # ── 7. OpenCode AI + REA ──────────────────────────────────────────────
+      - name: Install OpenCode AI and REA Tools
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          try { npm install -g opencode-ai @opencode/cli rea-agents --force } catch { Write-Output "[!] npm: $_" }
+          try {
+            $npmPrefix = (npm config get prefix).Trim()
+            $curPath = [Environment]::GetEnvironmentVariable("Path","Machine")
+            if ($curPath -notlike "*$npmPrefix*") {
+              [Environment]::SetEnvironmentVariable("Path","$curPath;$npmPrefix","Machine")
+            }
+          } catch {}
+
+          reg add "HKCU\Console" /v CodePage /t REG_DWORD /d 65001 /f | Out-Null
+          reg add "HKCU\Console" /v VirtualTerminalLevel /t REG_DWORD /d 1 /f | Out-Null
+
+          $regPreload = "HKCU:\Keyboard Layout\Preload"
+          if (-not (Test-Path $regPreload)) { New-Item -Path $regPreload -Force | Out-Null }
+          Set-ItemProperty -Path $regPreload -Name "1" -Value "00000409" -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $regPreload -Name "2" -Value "00000401" -ErrorAction SilentlyContinue
+
+          $arabicRules = @(
+            '# Arabic Language Rules',
+            '- Always write in proper connected Arabic.',
+            '- Never add spaces between letters of the same word.',
+            '- Keep English/code identifiers as-is, explain in Arabic.'
+          ) -join "`r`n"
+
+          $cfg = @{
+            "`$schema" = "https://opencode.ai/config.json"
+            instructions = @("C:\Users\Public\.config\opencode\arabic_rules.md")
+            mcp = @{ rea = @{ type = "local"; command = @("npx","-y","rea-agents","mcp"); enabled = $true } }
+          } | ConvertTo-Json -Depth 5
+
+          $dirs = @(
+            "C:\Users\Public\.config\opencode",
+            "C:\Users\VEXOR\.config\opencode",
+            "C:\Users\VEXOR\AppData\Roaming\opencode",
+            "C:\Users\VEXOR",
+            "C:\Users\runneradmin\.config\opencode",
+            "C:\Users\runneradmin\AppData\Roaming\opencode",
+            "C:\Users\Default\.config\opencode"
+          )
+          foreach ($d in $dirs) {
+            if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+            Set-Content "$d\opencode.json" -Value $cfg -Encoding UTF8
+            Set-Content "$d\arabic_rules.md" -Value $arabicRules -Encoding UTF8
+            Set-Content "$d\AGENTS.md"       -Value $arabicRules -Encoding UTF8
+          }
+          Write-Output "[+] OpenCode AI + REA configured"
+
+                # ── 8. Delta Restore + Baseline ───────────────────────────────────────
+      - name: Baseline Snapshot and Delta Restore
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $chainId = "${{ inputs.chain_id }}".Trim()
+          $vpsUrl  = "http://191.215.42.79:8765/backup/$chainId?secret=gitube_delta_2026"
+
+          function Get-DirNames($path) {
+            if (Test-Path $path) { return @(Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) }
+            return @()
+          }
+
+          $baseline = @{
+            ProgramFiles     = Get-DirNames "C:\Program Files"
+            ProgramFilesX86  = Get-DirNames "C:\Program Files (x86)"
+            AppDataLocalProg = Get-DirNames "C:\Users\VEXOR\AppData\Local\Programs"
+            AppDataRoaming   = Get-DirNames "C:\Users\VEXOR\AppData\Roaming"
+            VEXORDesktop     = Get-DirNames "C:\Users\VEXOR\Desktop"
+            PublicDesktop    = Get-DirNames "C:\Users\Public\Desktop"
+            VEXORDownloads   = Get-DirNames "C:\Users\VEXOR\Downloads"
+            VEXORDocuments   = Get-DirNames "C:\Users\VEXOR\Documents"
+          }
+          $baseline | ConvertTo-Json -Depth 4 | Set-Content "C:\rdp_baseline.json" -Encoding UTF8
+          Write-Output "[+] Baseline recorded."
+
+          if ($chainId -ne "") {
+            Write-Output "[*] Chain ($chainId) active — checking VPS for delta backup..."
+            $zipFile    = "C:\delta_restore.zip"
+            $extractDir = "C:\delta_restore_stage"
+            try {
+              Invoke-WebRequest -Uri $vpsUrl -Method Get -OutFile $zipFile -TimeoutSec 120 -ErrorAction Stop
+              if ((Test-Path $zipFile) -and (Get-Item $zipFile).Length -gt 100) {
+                Write-Output "[+] Delta found ($((Get-Item $zipFile).Length) bytes) — restoring..."
+                Expand-Archive -Path $zipFile -DestinationPath $extractDir -Force
+                $map = @{
+                  "ProgramFiles"     = "C:\Program Files"
+                  "ProgramFilesX86"  = "C:\Program Files (x86)"
+                  "AppDataLocalProg" = "C:\Users\VEXOR\AppData\Local\Programs"
+                  "AppDataRoaming"   = "C:\Users\VEXOR\AppData\Roaming"
+                  "VEXORDesktop"     = "C:\Users\VEXOR\Desktop"
+                  "PublicDesktop"    = "C:\Users\Public\Desktop"
+                  "VEXORDownloads"   = "C:\Users\VEXOR\Downloads"
+                  "VEXORDocuments"   = "C:\Users\VEXOR\Documents"
+                  "OpenCodeConfig"   = "C:\Users\VEXOR\.config\opencode"
+                  "VEXORConfig"      = "C:\Users\VEXOR\.config\vexor"
+                }
+                foreach ($k in $map.Keys) {
+                  $src = Join-Path $extractDir $k
+                  $dst = $map[$k]
+                  if (Test-Path $src) {
+                    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+                    Copy-Item -Path "$src\*" -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
+                  }
+                }
+                if (Test-Path "$extractDir\user_apps.reg") {
+                  reg import "$extractDir\user_apps.reg" 2>$null
+                }
+                Remove-Item -Path $zipFile    -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Output "[+] Delta restored. Deleting from VPS..."
+                try { Invoke-RestMethod -Uri $vpsUrl -Method Delete -TimeoutSec 30 -ErrorAction SilentlyContinue | Out-Null } catch {}
+              }
+            } catch {
+              Write-Output "[*] No previous delta or already cleaned."
+            }
+          }
+
+          # Create delta exporter script
+          $deltaScript = @'
+          param([string]$ChainId)
+          if (-not $ChainId) { exit 0 }
+          $vpsUrl = "http://191.215.42.79:8765/backup/$ChainId?secret=gitube_delta_2026"
+          if (-not (Test-Path "C:\rdp_baseline.json")) { exit 0 }
+          $base  = Get-Content "C:\rdp_baseline.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          $stage = "C:\delta_export_stage"
+          $zipOut = "C:\delta_backup.zip"
+          Remove-Item -Path $stage  -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path $zipOut -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          $vpsPrefsUrl = "http://191.215.42.79:8765/sync-prefs/$ChainId?secret=gitube_delta_2026"
+          $syncPrefs = $null
+          try { $syncPrefs = Invoke-RestMethod -Uri $vpsPrefsUrl -Method Get -TimeoutSec 10 -ErrorAction SilentlyContinue } catch {}
+          if (-not $syncPrefs) {
+            $syncPrefs = @{ desktop=$true; downloads=$true; documents=$true; installed_apps=$true; appdata=$true; ai_projects=$true; vexor_config=$true }
+          }
+
+          $targets = @()
+          if ($syncPrefs.installed_apps) {
+            $targets += @{ Key="ProgramFiles";     Path="C:\Program Files" }
+            $targets += @{ Key="ProgramFilesX86";  Path="C:\Program Files (x86)" }
+            $targets += @{ Key="AppDataLocalProg"; Path="C:\Users\VEXOR\AppData\Local\Programs" }
+          }
+          if ($syncPrefs.appdata)      { $targets += @{ Key="AppDataRoaming"; Path="C:\Users\VEXOR\AppData\Roaming" } }
+          if ($syncPrefs.desktop)      {
+            $targets += @{ Key="VEXORDesktop";  Path="C:\Users\VEXOR\Desktop" }
+            $targets += @{ Key="PublicDesktop"; Path="C:\Users\Public\Desktop" }
+          }
+          if ($syncPrefs.downloads)    { $targets += @{ Key="VEXORDownloads";  Path="C:\Users\VEXOR\Downloads" } }
+          if ($syncPrefs.documents)    { $targets += @{ Key="VEXORDocuments";  Path="C:\Users\VEXOR\Documents" } }
+          if ($syncPrefs.ai_projects)  { $targets += @{ Key="OpenCodeConfig";  Path="C:\Users\VEXOR\.config\opencode" } }
+          # Always sync VEXOR config (services.json lives here)
+          $targets += @{ Key="VEXORConfig"; Path="C:\Users\VEXOR\.config\vexor" }
+
+          $foundCount = 0
+          foreach ($t in $targets) {
+            $p = $t.Path
+            if (-not (Test-Path $p)) { continue }
+            $origList = @($base.($t.Key))
+            $items = Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue
+            foreach ($item in $items) {
+              if ($origList -notcontains $item.Name -or $t.Key -eq "VEXORConfig") {
+                $destSub = Join-Path $stage $t.Key
+                if (-not (Test-Path $destSub)) { New-Item -ItemType Directory -Path $destSub -Force | Out-Null }
+                Copy-Item -Path $item.FullName -Destination (Join-Path $destSub $item.Name) -Recurse -Force -ErrorAction SilentlyContinue
+                $foundCount++
+              }
+            }
+          }
+
+          if ($foundCount -gt 0) {
+            Compress-Archive -Path "$stage\*" -DestinationPath $zipOut -CompressionLevel Fastest -Force
+            if (Test-Path $zipOut) {
+              try {
+                Invoke-RestMethod -Uri $vpsUrl -Method Post -InFile $zipOut -ContentType "application/octet-stream" -TimeoutSec 180 | Out-Null
+                Write-Output "[+] Delta synced ($foundCount items)"
+              } catch { Write-Output "[!] Delta sync failed: $_" }
+            }
+          }
+          Remove-Item -Path $stage  -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path $zipOut -Force -ErrorAction SilentlyContinue
+          '@
+          Set-Content -Path "C:\sync_delta_apps.ps1" -Value $deltaScript -Encoding UTF8
+
+                # ── 9. Start VEXOR Services (Bots + Services from services.json) ──────
+      - name: Start VEXOR Services
+        continue-on-error: true
+        shell: pwsh
+        env:
+          TUNNEL_HOST: ${{ steps.ngrok-tunnel.outputs.tunnel_url }}
+        run: |
+          $svcsFile = "C:\Users\VEXOR\.config\vexor\services.json"
+          $pidsFile = "C:\Users\VEXOR\.config\vexor\pids.json"
+
+          if (-not (Test-Path $svcsFile)) {
+            Write-Output "[*] No services.json — skipping service startup."
+            Write-Output "[*] Create C:\Users\VEXOR\.config\vexor\services.json to auto-start bots."
+            exit 0
+          }
+
+          $services = Get-Content $svcsFile -Raw | ConvertFrom-Json
+          $pids     = @{}
+          $tunnel   = $env:TUNNEL_HOST
+
+          foreach ($svc in $services) {
+            $interp = if ($svc.interpreter) { $svc.interpreter } else { "python3" }
+            $wdir   = if ($svc.working_dir) { $svc.working_dir } else { "C:\Users\VEXOR" }
+            $argStr = if ($svc.args)        { $svc.args -join ' ' } else { "" }
+            $logOut = "C:\logs\$($svc.name).log"
+            $logErr = "C:\logs\$($svc.name)_err.log"
+            $proc   = $null
+
+            try {
+              switch ($svc.type) {
+                "telegram_bot"         { $proc = Start-Process $interp     -ArgumentList "$($svc.path) $argStr" -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr }
+                "telegram_bot_polling" { $proc = Start-Process $interp     -ArgumentList "$($svc.path) $argStr" -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr }
+                "python"               { $proc = Start-Process "python3"   -ArgumentList "$($svc.path) $argStr" -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr }
+                "node"                 { $proc = Start-Process "node"      -ArgumentList "$($svc.path) $argStr" -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr }
+                default                { $proc = Start-Process $svc.path   -ArgumentList $argStr                -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr }
+              }
+
+              if ($proc) {
+                $pids[$svc.name] = $proc.Id
+                Write-Output "[+] Started: $($svc.name) | PID: $($proc.Id) | Type: $($svc.type)"
+
+                # Auto-set Telegram webhook to current ngrok URL
+                if ($svc.type -eq "telegram_bot" -and $svc.bot_token -and $tunnel) {
+                  Start-Sleep -Seconds 2
+                  $wpath = if ($svc.webhook_path) { $svc.webhook_path } else { "/webhook" }
+                  try {
+                    $body = @{ url = "https://$tunnel$wpath" } | ConvertTo-Json
+                    $resp = Invoke-RestMethod "https://api.telegram.org/bot$($svc.bot_token)/setWebhook" -Method Post -Body $body -ContentType "application/json"
+                    Write-Output "[+] Webhook -> https://$tunnel$wpath : $($resp.description)"
+                  } catch { Write-Output "[!] Webhook failed for $($svc.name): $_" }
+                }
+              }
+            } catch {
+              Write-Output "[!] Failed to start $($svc.name): $_"
+            }
+          }
+
+          $pids | ConvertTo-Json | Set-Content $pidsFile
+          Write-Output "[+] Service PIDs saved."
+
+                # ── 10. Keep Alive (watchdog + auto-restart at 350min) ───────────────
+      - name: Keep Alive Session
+        shell: pwsh
+        env:
+          TUNNEL_HOST:  ${{ steps.ngrok-tunnel.outputs.tunnel_url }}
+          CHAIN_ID:     ${{ inputs.chain_id }}
+          AUTO_RESTART: ${{ inputs.auto_restart }}
+          GH_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:      ${{ github.repository }}
+          GH_REF:       ${{ github.ref_name }}
+          WIN_VERSION:  ${{ inputs.windows_version }}
+          RAM_SIZE:     ${{ inputs.ram_size }}
+          NGROK_TOKEN:  ${{ inputs.ngrok_token }}
+          NGROK_REGION: ${{ inputs.ngrok_region }}
+        run: |
+          Write-Output "[+] VEXOR RDP Live: $env:TUNNEL_HOST"
+          $start          = Get-Date
+          $loops          = 0
+          $autoTriggered  = $false
+
+          while ($true) {
+            $elapsed = ((Get-Date) - $start).TotalMinutes
+            $loops++
+
+            # ── Ngrok service watchdog ──────────────────────────────────────
+            $svc = Get-Service -Name "ngrok" -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Running") {
+              Write-Output "[!] Ngrok down at $([Math]::Round($elapsed,1))m — restarting..."
+              Start-Service -Name "ngrok" -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 5
+
+              # Get new URL and re-update webhooks
+              $newUrl = $null
+              for ($i = 0; $i -lt 15; $i++) {
+                try {
+                  $r = Invoke-RestMethod "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+                  $t = $r.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+                  if ($t) { $newUrl = $t.public_url -replace "^tcp://",""; break }
+                } catch {}
+                Start-Sleep -Seconds 2
+              }
+              if ($newUrl) {
+                $env:TUNNEL_HOST = $newUrl
+                Write-Output "[+] New tunnel: $newUrl"
+                $svcsFile = "C:\Users\VEXOR\.config\vexor\services.json"
+                if (Test-Path $svcsFile) {
+                  (Get-Content $svcsFile | ConvertFrom-Json) | Where-Object { $_.type -eq "telegram_bot" -and $_.bot_token } | ForEach-Object {
+                    $wpath = if ($_.webhook_path) { $_.webhook_path } else { "/webhook" }
+                    try {
+                      Invoke-RestMethod "https://api.telegram.org/bot$($_.bot_token)/setWebhook" `
+                        -Method Post -Body (@{url="https://$newUrl$wpath"} | ConvertTo-Json) `
+                        -ContentType "application/json" | Out-Null
+                      Write-Output "[+] Webhook re-updated for $($_.name)"
+                    } catch {}
+                  }
+                }
+              }
+            }
+
+            # ── Services watchdog (every 5 loops = ~10 min) ────────────────
+            if ($loops % 5 -eq 0) {
+              $pidsFile = "C:\Users\VEXOR\.config\vexor\pids.json"
+              $svcsFile = "C:\Users\VEXOR\.config\vexor\services.json"
+              if ((Test-Path $pidsFile) -and (Test-Path $svcsFile)) {
+                $pidObj  = Get-Content $pidsFile | ConvertFrom-Json
+                $svcs    = Get-Content $svcsFile | ConvertFrom-Json
+                $pidMap  = @{}
+                foreach ($prop in $pidObj.PSObject.Properties) { $pidMap[$prop.Name] = $prop.Value }
+                $changed = $false
+
+                foreach ($svc2 in $svcs) {
+                  $pid = $pidMap[$svc2.name]
+                  if ($pid -and -not (Get-Process -Id $pid -ErrorAction SilentlyContinue)) {
+                    Write-Output "[!] $($svc2.name) (PID $pid) died — restarting..."
+                    $interp = if ($svc2.interpreter) { $svc2.interpreter } else { "python3" }
+                    $wdir   = if ($svc2.working_dir) { $svc2.working_dir } else { "C:\Users\VEXOR" }
+                    $argStr = if ($svc2.args)         { $svc2.args -join ' ' } else { "" }
+                    $lout   = "C:\logs\$($svc2.name).log"
+                    $lerr   = "C:\logs\$($svc2.name)_err.log"
+                    $newP   = $null
+                    switch ($svc2.type) {
+                      "telegram_bot"         { $newP = Start-Process $interp   -ArgumentList "$($svc2.path) $argStr" -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $lout -RedirectStandardError $lerr }
+                      "telegram_bot_polling" { $newP = Start-Process $interp   -ArgumentList "$($svc2.path) $argStr" -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $lout -RedirectStandardError $lerr }
+                      "python"               { $newP = Start-Process "python3" -ArgumentList "$($svc2.path) $argStr" -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $lout -RedirectStandardError $lerr }
+                      "node"                 { $newP = Start-Process "node"    -ArgumentList "$($svc2.path) $argStr" -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $lout -RedirectStandardError $lerr }
+                      default                { $newP = Start-Process $svc2.path -ArgumentList $argStr -WorkingDirectory $wdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $lout -RedirectStandardError $lerr }
+                    }
+                    if ($newP) { $pidMap[$svc2.name] = $newP.Id; $changed = $true; Write-Output "[+] Restarted $($svc2.name) PID: $($newP.Id)" }
+                  }
+                }
+                if ($changed) { $pidMap | ConvertTo-Json | Set-Content $pidsFile }
+              }
+            }
+
+            # ── Delta sync (every 5 loops) ─────────────────────────────────
+            if ($env:CHAIN_ID -and ($loops % 5 -eq 0)) {
+              try { powershell -NoProfile -ExecutionPolicy Bypass -File "C:\sync_delta_apps.ps1" -ChainId $env:CHAIN_ID } catch {}
+            }
+
+            # ── Auto-restart at 350 min (10 min before GitHub kills us) ────
+            if ($elapsed -ge 350 -and -not $autoTriggered -and $env:AUTO_RESTART -eq "true") {
+              Write-Output "[*] 350 min elapsed — saving delta + triggering next session..."
+
+              if ($env:CHAIN_ID) {
+                try { powershell -NoProfile -ExecutionPolicy Bypass -File "C:\sync_delta_apps.ps1" -ChainId $env:CHAIN_ID } catch {}
+              }
+
+              $body = @{
+                ref    = $env:GH_REF
+                inputs = @{
+                  windows_version = $env:WIN_VERSION
+                  ram_size        = $env:RAM_SIZE
+                  ngrok_token     = $env:NGROK_TOKEN
+                  ngrok_region    = $env:NGROK_REGION
+                  chain_id        = $env:CHAIN_ID
+                  auto_restart    = "true"
+                }
+              } | ConvertTo-Json -Depth 3
+
+              $headers = @{
+                "Authorization" = "token $env:GH_TOKEN"
+                "Accept"        = "application/vnd.github.v3+json"
+                "Content-Type"  = "application/json"
+              }
+              try {
+                Invoke-RestMethod "https://api.github.com/repos/$env:GH_REPO/actions/workflows/main.yml/dispatches" `
+                  -Method Post -Headers $headers -Body $body -ErrorAction Stop
+                Write-Output "[+] Next session triggered! Exiting keep-alive."
+                $autoTriggered = $true
+              } catch {
+                Write-Output "[!] Auto-restart failed: $_ — will retry next loop"
+              }
+              if ($autoTriggered) { break }
+            }
+
+            Write-Output "[~] $([Math]::Round($elapsed,1))m | Loop $loops | $env:TUNNEL_HOST"
+            Start-Sleep -Seconds 120
+          }
+
+                # ── 11. Cleanup ───────────────────────────────────────────────────────
+      - name: Cleanup and Final Sync
+        if: always()
+        shell: pwsh
+        env:
+          CHAIN_ID:     ${{ inputs.chain_id }}
+          AUTO_RESTART: ${{ inputs.auto_restart }}
+          GH_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:      ${{ github.repository }}
+          GH_REF:       ${{ github.ref_name }}
+          WIN_VERSION:  ${{ inputs.windows_version }}
+          RAM_SIZE:     ${{ inputs.ram_size }}
+          NGROK_TOKEN:  ${{ inputs.ngrok_token }}
+          NGROK_REGION: ${{ inputs.ngrok_region }}
+        run: |
+          # Final delta save
+          if ($env:CHAIN_ID) {
+            try { powershell -NoProfile -ExecutionPolicy Bypass -File "C:\sync_delta_apps.ps1" -ChainId $env:CHAIN_ID } catch {}
+          }
+          # Fallback trigger if keep-alive exited abnormally without auto-triggering
+          if ($env:AUTO_RESTART -eq "true") {
+            $body = @{
+              ref    = $env:GH_REF
+              inputs = @{
+                windows_version = $env:WIN_VERSION
+                ram_size        = $env:RAM_SIZE
+                ngrok_token     = $env:NGROK_TOKEN
+                ngrok_region    = $env:NGROK_REGION
+                chain_id        = $env:CHAIN_ID
+                auto_restart    = "true"
+              }
+            } | ConvertTo-Json -Depth 3
+            $headers = @{
+              "Authorization" = "token $env:GH_TOKEN"
+              "Accept"        = "application/vnd.github.v3+json"
+              "Content-Type"  = "application/json"
+            }
+            try {
+              Invoke-RestMethod "https://api.github.com/repos/$env:GH_REPO/actions/workflows/main.yml/dispatches" `
+                -Method Post -Headers $headers -Body $body -ErrorAction SilentlyContinue | Out-Null
+              Write-Output "[+] Fallback: next session triggered from cleanup."
+            } catch {}
+          }
+          try { C:\Windows\System32\ngrok.exe service stop } catch {}
+          try { C:\Windows\System32\ngrok.exe service uninstall } catch {}
+
+
+# ─── LINUX VPS JOB ───────────────────────────────────────────────────────────
+  vps-setup:
+    if: github.event.inputs.windows_version != '' && github.event.inputs.windows_version != null && !startsWith(github.event.inputs.windows_version, 'windows') && !startsWith(github.event.inputs.windows_version, 'win') && !startsWith(github.event.inputs.windows_version, 'mac')
+    runs-on: ${{ (github.event.inputs.windows_version == 'ubuntu-24.04' || github.event.inputs.windows_version == 'ubuntu24-ai' || github.event.inputs.windows_version == 'ubuntu24-gui-ai') && 'ubuntu-24.04' || ((github.event.inputs.windows_version == 'ubuntu-22.04' || github.event.inputs.windows_version == 'ubuntu22-ai' || github.event.inputs.windows_version == 'ubuntu22-gui-ai') && 'ubuntu-22.04' || 'ubuntu-latest') }}
+    timeout-minutes: 360
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      # ── 1. GUI Setup (XFCE + XRDP) ───────────────────────────────────────
+      - name: Setup GUI Desktop (XFCE + XRDP)
+        if: "endsWith(inputs.windows_version, '-gui') || endsWith(inputs.windows_version, '-gui-ai')"
+        run: |
+          TARGET_OS="${{ inputs.windows_version }}"
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            xfce4 xfce4-terminal xrdp xorgxrdp dbus-x11 x11-xserver-utils python3-tk curl wget nano python3-pip
+
+          echo "runner:VEXOR@2026" | sudo chpasswd
+          echo "root:VEXOR@2026"   | sudo chpasswd
+          sudo adduser xrdp ssl-cert
+          sudo adduser runner ssl-cert
+
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+          cat << 'EOF' | sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla > /dev/null
+          [Allow Colord all Users]
+          Identity=unix-user:*
+          Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
+          ResultAny=no
+          ResultInactive=no
+          ResultActive=yes
+          EOF
+
+          echo "startxfce4" > /home/runner/.xsession
+          chmod +x /home/runner/.xsession
+          sudo chown runner:runner /home/runner/.xsession
+
+          cat << 'EOF' | sudo tee /etc/xrdp/startwm.sh > /dev/null
+          #!/bin/sh
+          if [ -r /etc/default/locale ]; then . /etc/default/locale; export LANG LANGUAGE; fi
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          sudo sed -i '/^\[Xorg\]/,/^\[/ s/^username=.*/username=runner/' /etc/xrdp/xrdp.ini
+          sudo sed -i '/^\[Xorg\]/,/^\[/ s/^password=.*/password=VEXOR@2026/' /etc/xrdp/xrdp.ini
+          echo "TARGET_PORT=3389" >> $GITHUB_ENV
+
+                # ── 2. Kali Tools (GUI variant) ───────────────────────────────────────
+      - name: Setup Kali Offensive Tools
+        if: "endsWith(inputs.windows_version, '-gui') || endsWith(inputs.windows_version, '-gui-ai')"
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            nmap wireshark tshark aircrack-ng hydra john sqlmap netcat-traditional \
+            nikto dirb gobuster wfuzz hashcat tcpdump binwalk foremost testdisk steghide radare2 gdb || true
+          sudo mkdir -p /usr/share/wordlists
+          curl -sSL "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt" \
+            -o /usr/share/wordlists/rockyou.txt 2>/dev/null || true
+
+          # Kali welcome script
+          cat << 'EOF' | sudo tee /usr/local/bin/vexor_welcome.sh > /dev/null
+          #!/bin/bash
+          clear
+          echo "============================================================"
+          echo "   VEXOR LINUX OFFENSIVE SUITE"
+          echo "============================================================"
+          echo "  [+] User       : runner / root"
+          echo "  [+] Password   : VEXOR@2026"
+          echo "  [+] Wordlists  : /usr/share/wordlists/rockyou.txt"
+          echo "------------------------------------------------------------"
+          echo "  Network  : nmap, wireshark, tshark, netcat, tcpdump"
+          echo "  Passwords: john, hydra, hashcat"
+          echo "  Web      : sqlmap, nikto, dirb, gobuster, wfuzz"
+          echo "  Wireless : aircrack-ng"
+          echo "  Forensics: binwalk, foremost, testdisk, steghide, radare2"
+          echo "============================================================"
+          exec bash
+          EOF
+          sudo chmod +x /usr/local/bin/vexor_welcome.sh
+
+          mkdir -p /home/runner/.config/autostart
+          cat << 'EOF' | sudo tee /home/runner/.config/autostart/vexor.desktop > /dev/null
+          [Desktop Entry]
+          Type=Application
+          Name=VEXOR Suite
+          Exec=xfce4-terminal --title="VEXOR Suite" --geometry=110x32 -e /usr/local/bin/vexor_welcome.sh
+          Hidden=false
+          NoDisplay=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          sudo chown -R runner:runner /home/runner/Desktop /home/runner/.config 2>/dev/null || true
+          sudo systemctl restart xrdp-sesman || sudo service xrdp-sesman restart || true
+          sudo systemctl restart xrdp        || sudo service xrdp restart        || true
+
+                # ── 3. Native Ubuntu SSH ──────────────────────────────────────────────
+      - name: Setup Native Ubuntu VPS SSH
+        if: "(startsWith(inputs.windows_version, 'ubuntu') || startsWith(inputs.windows_version, 'ubuntu2')) && !contains(inputs.windows_version, '-gui')"
+        run: |
+          echo "root:VEXOR@2026"   | sudo chpasswd
+          echo "runner:VEXOR@2026" | sudo chpasswd
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PermitRootLogin no/PermitRootLogin yes/'                 /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/'   /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh || sudo service ssh restart
+          cat >> /home/runner/.bashrc << 'EOF'
+          echo "========================================"
+          echo "  VEXOR Ubuntu VPS"
+          echo "  User: runner / root | Pass: VEXOR@2026"
+          echo "========================================"
+          EOF
+          echo "TARGET_PORT=22" >> $GITHUB_ENV
+
+                # ── 4. Containerized Distros ──────────────────────────────────────────
+      - name: Setup Containerized Distro VPS
+        if: "!startsWith(inputs.windows_version, 'ubuntu') && !startsWith(inputs.windows_version, 'ubuntu2') && !endsWith(inputs.windows_version, '-gui') && !endsWith(inputs.windows_version, '-gui-ai')"
+        run: |
+          TARGET_OS="${{ inputs.windows_version }}"
+          DOCKER_IMG="debian:12"
+
+          # Write setup script based on distro (all use VEXOR@2026)
+          if [[ "$TARGET_OS" =~ ^debian ]]; then
+            DOCKER_IMG="debian:12"
+            cat > /tmp/setup.sh << 'VXEOF'
+          #!/bin/sh
+          DEBIAN_FRONTEND=noninteractive apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server sudo curl wget nano bash procps passwd
+          mkdir -p /var/run/sshd /etc/ssh/sshd_config.d
+          echo 'root:VEXOR@2026' | chpasswd
+          useradd -m -s /bin/bash runner
+          echo 'runner:VEXOR@2026' | chpasswd
+          usermod -aG sudo runner
+          echo 'runner ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
+          echo 'PermitRootLogin yes'            > /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'KbdInteractiveAuthentication yes' >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PermitRootLogin yes'           >> /etc/ssh/sshd_config
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config
+          echo '=== VEXOR Debian 12 VPS ===' >> /home/runner/.bashrc
+          exec /usr/sbin/sshd -D
+          VXEOF
+          elif [[ "$TARGET_OS" =~ ^kali ]]; then
+            DOCKER_IMG="kalilinux/kali-rolling"
+            cat > /tmp/setup.sh << 'VXEOF'
+          #!/bin/sh
+          DEBIAN_FRONTEND=noninteractive apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server sudo curl wget nano bash procps passwd nmap netcat-traditional
+          mkdir -p /var/run/sshd /etc/ssh/sshd_config.d
+          echo 'root:VEXOR@2026' | chpasswd
+          useradd -m -s /bin/bash runner
+          echo 'runner:VEXOR@2026' | chpasswd
+          usermod -aG sudo runner
+          echo 'runner ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
+          echo 'PermitRootLogin yes'            > /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'KbdInteractiveAuthentication yes' >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PermitRootLogin yes'           >> /etc/ssh/sshd_config
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config
+          echo '=== VEXOR Kali Linux VPS ===' >> /home/runner/.bashrc
+          exec /usr/sbin/sshd -D
+          VXEOF
+          elif [[ "$TARGET_OS" =~ ^alpine ]]; then
+            DOCKER_IMG="alpine:latest"
+            cat > /tmp/setup.sh << 'VXEOF'
+          #!/bin/sh
+          apk update
+          apk add --no-cache openssh bash sudo curl wget nano procps shadow
+          ssh-keygen -A
+          mkdir -p /etc/ssh/sshd_config.d
+          echo 'root:VEXOR@2026' | chpasswd
+          adduser -D -s /bin/bash runner
+          echo 'runner:VEXOR@2026' | chpasswd
+          echo 'runner ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          echo 'PermitRootLogin yes'            > /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PermitRootLogin yes'           >> /etc/ssh/sshd_config
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config
+          echo '=== VEXOR Alpine VPS ===' >> /home/runner/.bashrc
+          exec /usr/sbin/sshd -D
+          VXEOF
+          elif [[ "$TARGET_OS" =~ ^arch ]]; then
+            DOCKER_IMG="archlinux:latest"
+            cat > /tmp/setup.sh << 'VXEOF'
+          #!/bin/sh
+          sed -i 's/SigLevel.*=.*Required.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm openssh sudo curl wget nano bash procps-ng shadow
+          ssh-keygen -A
+          mkdir -p /etc/ssh/sshd_config.d
+          echo 'root:VEXOR@2026' | chpasswd
+          useradd -m -s /bin/bash runner
+          echo 'runner:VEXOR@2026' | chpasswd
+          echo 'runner ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
+          echo 'PermitRootLogin yes'            > /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PermitRootLogin yes'           >> /etc/ssh/sshd_config
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config
+          echo '=== VEXOR Arch Linux VPS ===' >> /home/runner/.bashrc
+          exec /usr/sbin/sshd -D
+          VXEOF
+          elif [[ "$TARGET_OS" =~ ^fedora ]]; then
+            DOCKER_IMG="fedora:40"
+            cat > /tmp/setup.sh << 'VXEOF'
+          #!/bin/sh
+          dnf install -y --setopt=install_weak_deps=False --nodocs openssh-server passwd sudo curl wget nano bash procps-ng
+          ssh-keygen -A
+          mkdir -p /etc/ssh/sshd_config.d
+          echo 'root:VEXOR@2026' | chpasswd
+          useradd -m -s /bin/bash runner
+          echo 'runner:VEXOR@2026' | chpasswd
+          usermod -aG wheel runner
+          echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
+          chmod 0640 /etc/shadow 2>/dev/null || true
+          echo 'PermitRootLogin yes'            > /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'KbdInteractiveAuthentication yes' >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PermitRootLogin yes'           >> /etc/ssh/sshd_config
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config
+          echo '=== VEXOR Fedora 40 VPS ===' >> /home/runner/.bashrc
+          exec /usr/sbin/sshd -D
+          VXEOF
+          elif [[ "$TARGET_OS" =~ ^rocky ]]; then
+            DOCKER_IMG="rockylinux:9"
+            cat > /tmp/setup.sh << 'VXEOF'
+          #!/bin/sh
+          dnf install -y --setopt=install_weak_deps=False --nodocs openssh-server passwd sudo curl wget nano bash procps-ng
+          ssh-keygen -A
+          mkdir -p /etc/ssh/sshd_config.d
+          echo 'root:VEXOR@2026' | chpasswd
+          useradd -m -s /bin/bash runner
+          echo 'runner:VEXOR@2026' | chpasswd
+          usermod -aG wheel runner
+          echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
+          chmod 0640 /etc/shadow 2>/dev/null || true
+          echo 'PermitRootLogin yes'            > /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'KbdInteractiveAuthentication yes' >> /etc/ssh/sshd_config.d/01-auth.conf
+          echo 'PermitRootLogin yes'           >> /etc/ssh/sshd_config
+          echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config
+          echo '=== VEXOR Rocky Linux 9 VPS ===' >> /home/runner/.bashrc
+          exec /usr/sbin/sshd -D
+          VXEOF
+          fi
+
+          chmod +x /tmp/setup.sh
+          echo "[*] Launching $DOCKER_IMG on port 2222..."
+          docker run -d --name vps --privileged -p 2222:22 -v /tmp/setup.sh:/setup.sh "$DOCKER_IMG" sh /setup.sh
+          echo "TARGET_PORT=2222" >> $GITHUB_ENV
+
+                # ── 5. Wait for port ──────────────────────────────────────────────────
+      - name: Wait for Service Port
+        run: |
+          port="${{ env.TARGET_PORT }}"
+          if [ -z "$port" ]; then port=22; fi
+          for i in $(seq 1 90); do
+            if nc -z 127.0.0.1 $port 2>/dev/null || (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+              echo "[+] Port $port live in ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ] || [ "$i" -eq 60 ]; then
+              echo "[*] Still waiting (${i}s)..."
+              docker logs vps --tail 5 2>/dev/null || true
+            fi
+            sleep 1
+          done
+
+                # ── 6. OpenCode AI + REA (Linux) ──────────────────────────────────────
+      - name: Install OpenCode AI and REA (Linux)
+        continue-on-error: true
+        run: |
+          sudo npm install -g opencode-ai @opencode/cli rea-agents --force || \
+          curl -fsSL https://opencode.ai/install | bash || true
+          sudo pip3 install requests --break-system-packages 2>/dev/null || sudo pip3 install requests || true
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            fonts-noto-core fonts-arabeyes fonts-dejavu-core 2>/dev/null || true
+
+          for p in /home/runner /root /etc/skel; do
+            sudo mkdir -p "$p/.config/opencode" "$p/.config/vexor"
+            echo '{"$schema":"https://opencode.ai/config.json","mcp":{"rea":{"type":"local","command":["npx","-y","rea-agents","mcp"],"enabled":true}}}' | \
+              sudo tee "$p/.config/opencode/opencode.json" > /dev/null
+            echo 'export LANG=en_US.UTF-8'      | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'export LC_ALL=en_US.UTF-8'    | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'export PYTHONIOENCODING=utf-8' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'alias rea="rea-agents"'        | sudo tee -a "$p/.bashrc" > /dev/null
+            sudo chown -R runner:runner "$p/.config" 2>/dev/null || true
+          done
+          echo "[+] OpenCode AI + REA ready on Linux"
+
+                # ── 7. Ngrok Tunnel (Linux) ───────────────────────────────────────────
+      - name: Configure and Start Ngrok Tunnel
+        id: ngrok-tunnel
+        run: |
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz
+          sudo mv ngrok /usr/local/bin/ngrok
+
+          tok="${{ inputs.ngrok_token }}"
+          if [ -z "$tok" ]; then tok="${{ secrets.NGROK_AUTH_TOKEN }}"; fi
+          reg="${{ inputs.ngrok_region }}"
+          if [ -z "$reg" ] || [ "$reg" = "gb" ]; then reg="eu"; fi
+          port="${{ env.TARGET_PORT }}"
+          if [ -z "$port" ]; then port=22; fi
+
+          nohup ngrok tcp "$port" --authtoken "$tok" --region "$reg" --log=stdout > /tmp/ngrok.log 2>&1 &
+          sleep 3
+          tunnel_url=""
+          for i in $(seq 1 25); do
+            tunnel_url=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o 'tcp://[^"]*' | head -n1 | sed 's|tcp://||')
+            if [ -n "$tunnel_url" ]; then break; fi
+            sleep 2
+          done
+          if [ -n "$tunnel_url" ]; then
+            echo "tunnel_url=$tunnel_url" >> $GITHUB_OUTPUT
+            echo "TUNNEL_HOST=$tunnel_url" >> $GITHUB_ENV
+            echo "[+] Tunnel: $tunnel_url"
+          else
+            cat /tmp/ngrok.log
+            exit 1
+          fi
+
+                # ── 8. Build SSH connection info ──────────────────────────────────────
+      - name: Build Connection Artifact
+        run: |
+          url="${{ steps.ngrok-tunnel.outputs.tunnel_url }}"
+          host=$(echo $url | cut -d: -f1)
+          sshport=$(echo $url | cut -d: -f2)
+
+          cat > connection-info.txt << EOF
+          ============================================
+           VEXOR Linux VPS — Connection Info
+          ============================================
+           SSH Host : $host
+           SSH Port : $sshport
+           User     : runner
+           Password : VEXOR@2026
+          
+           Command  : ssh runner@$host -p $sshport
+          ============================================
+          EOF
+
+          cat > rdp-connection.rdp << EOF
+          full address:s:$url
+          username:s:runner
+          prompt for credentials:i:1
+          administrative session:i:1
+          authentication level:i:0
+          enablecredsspsupport:i:0
+          autoreconnection enabled:i:1
+          smart sizing:i:1
+          screen mode id:i:2
+          desktopwidth:i:1920
+          desktopheight:i:1080
+          redirectclipboard:i:1
+          EOF
+          cat connection-info.txt
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-connection
+          path: |
+            rdp-connection.rdp
+            connection-info.txt
+          retention-days: 1
+
+      # ── 9. Linux Delta Restore ────────────────────────────────────────────
+      - name: Delta Restore (Linux)
+        continue-on-error: true
+        run: |
+          CHAIN_ID="${{ inputs.chain_id }}"
+          VPS_URL="http://191.215.42.79:8765/backup/$CHAIN_ID?secret=gitube_delta_2026"
+
+          if [ -z "$CHAIN_ID" ]; then
+            echo "[*] No chain_id — skipping delta restore."
+            exit 0
+          fi
+
+          echo "[*] Checking VPS for delta backup (chain: $CHAIN_ID)..."
+          curl -s -o /tmp/delta_restore.zip "$VPS_URL" --max-time 120 || true
+
+          if [ -f /tmp/delta_restore.zip ] && [ "$(wc -c < /tmp/delta_restore.zip)" -gt 100 ]; then
+            echo "[+] Delta found — restoring..."
+            mkdir -p /tmp/delta_stage
+            unzip -o /tmp/delta_restore.zip -d /tmp/delta_stage || true
+            rsync -a /tmp/delta_stage/home_runner/ /home/runner/ 2>/dev/null || true
+            rm -rf /tmp/delta_restore.zip /tmp/delta_stage
+
+            echo "[+] Delta restored. Deleting from VPS..."
+            curl -s -X DELETE "$VPS_URL" --max-time 30 || true
+          else
+            echo "[*] No delta backup found — fresh start."
+            rm -f /tmp/delta_restore.zip
+          fi
+
+                # ── 10. Start VEXOR Services (Linux) ─────────────────────────────────
+      - name: Start VEXOR Services (Linux)
+        continue-on-error: true
+        env:
+          TUNNEL_HOST: ${{ steps.ngrok-tunnel.outputs.tunnel_url }}
+        run: |
+          SVCS_FILE="/home/runner/.config/vexor/services.json"
+          PIDS_FILE="/home/runner/.config/vexor/pids.json"
+
+          if [ ! -f "$SVCS_FILE" ]; then
+            echo "[*] No services.json — skipping."
+            echo "[*] Create $SVCS_FILE to auto-start bots and services."
+            exit 0
+          fi
+
+          TUNNEL="$TUNNEL_HOST"
+
+          python3 << PYEOF
+          import json, subprocess, os, sys, time
+
+          SVCS_FILE = "/home/runner/.config/vexor/services.json"
+          PIDS_FILE = "/home/runner/.config/vexor/pids.json"
+          TUNNEL    = os.environ.get("TUNNEL_HOST", "")
+
+          with open(SVCS_FILE) as f:
+              services = json.load(f)
+
+          pids = {}
+          os.makedirs("/home/runner/logs", exist_ok=True)
+
+          for svc in services:
+              name     = svc.get("name", "unknown")
+              svc_type = svc.get("type", "process")
+              wdir     = svc.get("working_dir", "/home/runner")
+              args     = svc.get("args", [])
+              interp   = svc.get("interpreter", "python3")
+              log_out  = open(f"/home/runner/logs/{name}.log", "a")
+              log_err  = open(f"/home/runner/logs/{name}_err.log", "a")
+
+              try:
+                  if svc_type in ("telegram_bot", "telegram_bot_polling"):
+                      cmd = [interp, svc["path"]] + args
+                  elif svc_type == "python":
+                      cmd = ["python3", svc["path"]] + args
+                  elif svc_type == "node":
+                      cmd = ["node", svc["path"]] + args
+                  else:
+                      cmd = [svc["path"]] + args
+
+                  proc = subprocess.Popen(cmd, cwd=wdir, stdout=log_out, stderr=log_err)
+                  pids[name] = proc.pid
+                  print(f"[+] Started: {name} | PID: {proc.pid} | Type: {svc_type}")
+
+                  # Telegram webhook auto-update
+                  if svc_type == "telegram_bot" and svc.get("bot_token") and TUNNEL:
+                      time.sleep(2)
+                      wpath = svc.get("webhook_path", "/webhook")
+                      try:
+                          import urllib.request, urllib.parse
+                          data = json.dumps({"url": f"https://{TUNNEL}{wpath}"}).encode()
+                          req  = urllib.request.Request(
+                              f"https://api.telegram.org/bot{svc['bot_token']}/setWebhook",
+                              data=data, headers={"Content-Type": "application/json"}
+                          )
+                          resp = urllib.request.urlopen(req, timeout=10)
+                          print(f"[+] Webhook set for {name}: https://{TUNNEL}{wpath}")
+                      except Exception as e:
+                          print(f"[!] Webhook failed for {name}: {e}")
+
+              except Exception as e:
+                  print(f"[!] Failed to start {name}: {e}")
+
+          with open(PIDS_FILE, "w") as f:
+              json.dump(pids, f)
+          print(f"[+] PIDs saved to {PIDS_FILE}")
+          PYEOF
+
+                # ── 11. Linux Delta Exporter script ───────────────────────────────────
+      - name: Create Linux Delta Sync Script
+        run: |
+          cat > /home/runner/sync_delta.sh << 'DELTAEOF'
+          #!/bin/bash
+          CHAIN_ID="$1"
+          if [ -z "$CHAIN_ID" ]; then exit 0; fi
+          VPS_URL="http://191.215.42.79:8765/backup/$CHAIN_ID?secret=gitube_delta_2026"
+          STAGE="/tmp/delta_export_stage"
+          ZIPOUT="/tmp/delta_backup.zip"
+          rm -rf "$STAGE" "$ZIPOUT"
+          mkdir -p "$STAGE/home_runner"
+          # Sync user data (services.json, bots, apps, configs)
+          rsync -a --exclude='.cache' --exclude='*.log' \
+            /home/runner/.config/vexor/  "$STAGE/home_runner/.config/vexor/"  2>/dev/null || true
+          rsync -a \
+            /home/runner/.config/opencode/ "$STAGE/home_runner/.config/opencode/" 2>/dev/null || true
+          rsync -a --exclude='*.log' \
+            /home/runner/bots/   "$STAGE/home_runner/bots/"   2>/dev/null || true
+          rsync -a --exclude='*.log' \
+            /home/runner/apps/   "$STAGE/home_runner/apps/"   2>/dev/null || true
+          rsync -a \
+            /home/runner/Desktop/ "$STAGE/home_runner/Desktop/" 2>/dev/null || true
+          rsync -a \
+            /home/runner/Documents/ "$STAGE/home_runner/Documents/" 2>/dev/null || true
+
+          if [ "$(find $STAGE -type f | wc -l)" -gt 0 ]; then
+            cd "$STAGE" && zip -r "$ZIPOUT" . -x "*.log" 2>/dev/null
+            if [ -f "$ZIPOUT" ]; then
+              curl -s -X POST "$VPS_URL" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary "@$ZIPOUT" --max-time 180 && \
+              echo "[+] Linux delta synced."
+            fi
+          fi
+          rm -rf "$STAGE" "$ZIPOUT"
+          DELTAEOF
+          chmod +x /home/runner/sync_delta.sh
+
+                # ── 12. Keep Alive (Linux) ────────────────────────────────────────────
+      - name: Keep Alive Session
+        env:
+          CHAIN_ID:     ${{ inputs.chain_id }}
+          AUTO_RESTART: ${{ inputs.auto_restart }}
+          GH_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:      ${{ github.repository }}
+          GH_REF:       ${{ github.ref_name }}
+          WIN_VERSION:  ${{ inputs.windows_version }}
+          RAM_SIZE:     ${{ inputs.ram_size }}
+          NGROK_TOKEN:  ${{ inputs.ngrok_token }}
+          NGROK_REGION: ${{ inputs.ngrok_region }}
+          TUNNEL_HOST:  ${{ steps.ngrok-tunnel.outputs.tunnel_url }}
+        run: |
+          echo "[+] VEXOR Linux VPS Live: $TUNNEL_HOST"
+          START=$(date +%s)
+          LOOPS=0
+          AUTO_TRIGGERED=0
+          PORT="${{ env.TARGET_PORT }}"
+          if [ -z "$PORT" ]; then PORT=22; fi
+          REG="${{ inputs.ngrok_region }}"
+          if [ -z "$REG" ] || [ "$REG" = "gb" ]; then REG="eu"; fi
+
+          while true; do
+            NOW=$(date +%s)
+            ELAPSED=$(( (NOW - START) / 60 ))
+            LOOPS=$((LOOPS + 1))
+
+            # ── Ngrok watchdog ──────────────────────────────────────────────
+            if ! pgrep -x "ngrok" > /dev/null; then
+              echo "[!] Ngrok down at ${ELAPSED}m — restarting..."
+              nohup ngrok tcp "$PORT" --region "$REG" --log=stdout > /tmp/ngrok.log 2>&1 &
+              sleep 5
+              NEW_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o 'tcp://[^"]*' | head -n1 | sed 's|tcp://||')
+              if [ -n "$NEW_URL" ]; then
+                TUNNEL_HOST="$NEW_URL"
+                echo "[+] New tunnel: $NEW_URL"
+                # Re-update Telegram webhooks
+                if [ -f "/home/runner/.config/vexor/services.json" ]; then
+                  python3 -c "
+          import json, urllib.request
+          with open('/home/runner/.config/vexor/services.json') as f: svcs = json.load(f)
+          for s in svcs:
+              if s.get('type') == 'telegram_bot' and s.get('bot_token') and '$NEW_URL':
+                  wpath = s.get('webhook_path', '/webhook')
+                  try:
+            data = json.dumps({'url': f'https://$NEW_URL{wpath}'}).encode()
+            req = urllib.request.Request(f\"https://api.telegram.org/bot{s['bot_token']}/setWebhook\",
+                                          data=data, headers={'Content-Type':'application/json'})
+            urllib.request.urlopen(req, timeout=10)
+            print(f\"[+] Webhook re-updated for {s['name']}\")
+                  except Exception as e:
+            print(f\"[!] Webhook re-update failed: {e}\")
+          " 2>/dev/null || true
+                fi
+              fi
+            fi
+
+            # ── Services watchdog (every 5 loops = ~10 min) ────────────────
+            if [ $((LOOPS % 5)) -eq 0 ] && [ -f "/home/runner/.config/vexor/pids.json" ]; then
+              python3 << 'WDEOF'
+          import json, os, subprocess, time
+
+          PIDS_FILE = "/home/runner/.config/vexor/pids.json"
+          SVCS_FILE = "/home/runner/.config/vexor/services.json"
+
+          if not os.path.exists(SVCS_FILE): exit(0)
+          with open(PIDS_FILE) as f: pids = json.load(f)
+          with open(SVCS_FILE) as f: svcs = json.load(f)
+
+          changed = False
+          for svc in svcs:
+              name = svc["name"]
+              pid  = pids.get(name)
+              if not pid: continue
+              try:
+                  os.kill(pid, 0)
+              except ProcessLookupError:
+                  print(f"[!] {name} (PID {pid}) died — restarting...")
+                  svc_type = svc.get("type", "process")
+                  interp   = svc.get("interpreter", "python3")
+                  wdir     = svc.get("working_dir", "/home/runner")
+                  args     = svc.get("args", [])
+                  if svc_type in ("telegram_bot", "telegram_bot_polling"): cmd = [interp, svc["path"]] + args
+                  elif svc_type == "python": cmd = ["python3", svc["path"]] + args
+                  elif svc_type == "node":   cmd = ["node",    svc["path"]] + args
+                  else:                      cmd = [svc["path"]] + args
+                  log = open(f"/home/runner/logs/{name}.log", "a")
+                  proc = subprocess.Popen(cmd, cwd=wdir, stdout=log, stderr=log)
+                  pids[name] = proc.pid
+                  changed = True
+                  print(f"[+] Restarted {name} PID: {proc.pid}")
+
+          if changed:
+              with open(PIDS_FILE, "w") as f: json.dump(pids, f)
+          WDEOF
+            fi
+
+            # ── Delta sync (every 5 loops) ──────────────────────────────────
+            if [ -n "$CHAIN_ID" ] && [ $((LOOPS % 5)) -eq 0 ]; then
+              /home/runner/sync_delta.sh "$CHAIN_ID" 2>/dev/null || true
+            fi
+
+            # ── Auto-restart at 350 min ─────────────────────────────────────
+            if [ "$ELAPSED" -ge 350 ] && [ "$AUTO_TRIGGERED" -eq 0 ] && [ "$AUTO_RESTART" = "true" ]; then
+              echo "[*] 350 min elapsed — saving delta + triggering next session..."
+
+              if [ -n "$CHAIN_ID" ]; then
+                /home/runner/sync_delta.sh "$CHAIN_ID" 2>/dev/null || true
+              fi
+
+              BODY=$(python3 -c "
+          import json
+          print(json.dumps({
+              'ref': '$GH_REF',
+              'inputs': {
+                  'windows_version': '$WIN_VERSION',
+                  'ram_size': '$RAM_SIZE',
+                  'ngrok_token': '$NGROK_TOKEN',
+                  'ngrok_region': '$NGROK_REGION',
+                  'chain_id': '$CHAIN_ID',
+                  'auto_restart': 'true'
+              }
+          }))
+          ")
+              HTTP_CODE=$(curl -s -o /tmp/gh_trigger_resp.txt -w "%{http_code}" \
+                -X POST \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$GH_REPO/actions/workflows/main.yml/dispatches" \
+                -d "$BODY")
+
+              if [ "$HTTP_CODE" = "204" ]; then
+                echo "[+] Next session triggered! (HTTP 204)"
+                AUTO_TRIGGERED=1
+                break
+              else
+                echo "[!] Auto-restart failed (HTTP $HTTP_CODE): $(cat /tmp/gh_trigger_resp.txt)"
+              fi
+            fi
+
+            echo "[~] ${ELAPSED}m elapsed | Loop $LOOPS | $TUNNEL_HOST"
+            sleep 120
+          done
+
+                # ── 13. Cleanup (Linux) ───────────────────────────────────────────────
+      - name: Cleanup and Final Sync
+        if: always()
+        env:
+          CHAIN_ID:     ${{ inputs.chain_id }}
+          AUTO_RESTART: ${{ inputs.auto_restart }}
+          GH_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:      ${{ github.repository }}
+          GH_REF:       ${{ github.ref_name }}
+          WIN_VERSION:  ${{ inputs.windows_version }}
+          RAM_SIZE:     ${{ inputs.ram_size }}
+          NGROK_TOKEN:  ${{ inputs.ngrok_token }}
+          NGROK_REGION: ${{ inputs.ngrok_region }}
+        run: |
+          if [ -n "$CHAIN_ID" ]; then
+            /home/runner/sync_delta.sh "$CHAIN_ID" 2>/dev/null || true
+          fi
+          # Fallback trigger
+          if [ "$AUTO_RESTART" = "true" ]; then
+            BODY=$(python3 -c "
+          import json
+          print(json.dumps({
+              'ref': '$GH_REF',
+              'inputs': {
+                  'windows_version': '$WIN_VERSION',
+                  'ram_size': '$RAM_SIZE',
+                  'ngrok_token': '$NGROK_TOKEN',
+                  'ngrok_region': '$NGROK_REGION',
+                  'chain_id': '$CHAIN_ID',
+                  'auto_restart': 'true'
+              }
+          }))
+          ")
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$GH_REPO/actions/workflows/main.yml/dispatches" \
+              -d "$BODY" || true
+            echo "[+] Fallback trigger sent from cleanup."
+          fi
+          pkill ngrok 2>/dev/null || true
