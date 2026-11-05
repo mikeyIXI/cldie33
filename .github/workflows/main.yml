@@ -59,6 +59,10 @@ on:
         default: 'true'
 
 # ─── WINDOWS RDP JOB ─────────────────────────────────────────────────────────
+concurrency:
+  group: vexor-rdp
+  cancel-in-progress: false
+
 jobs:
   rdp-setup:
     if: startsWith(github.event.inputs.windows_version, 'windows') || startsWith(github.event.inputs.windows_version, 'win') || github.event.inputs.windows_version == '' || github.event.inputs.windows_version == null
@@ -139,14 +143,14 @@ jobs:
           secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
           Remove-Item -Force C:\secpol.cfg -ErrorAction SilentlyContinue
 
-          cmd.exe /c "net user VEXOR VEXOR@2026 /add /expires:never /active:yes"
-          cmd.exe /c "net localgroup Administrators VEXOR /add"
-          cmd.exe /c "net localgroup `"Remote Desktop Users`" VEXOR /add"
-          cmd.exe /c "net user runneradmin VEXOR@2026 /active:yes"
+          cmd.exe /c "net user mikey mikey /add /expires:never /active:yes"
+          cmd.exe /c "net localgroup Administrators mikey /add"
+          cmd.exe /c "net localgroup `"Remote Desktop Users`" mikey /add"
+          cmd.exe /c "net user runneradmin mikey /active:yes"
 
           New-Item -ItemType Directory -Force -Path "C:\logs" | Out-Null
           New-Item -ItemType Directory -Force -Path "C:\Users\VEXOR\.config\vexor" | Out-Null
-          Write-Output "[+] User VEXOR created with password VEXOR@2026"
+          Write-Output "[+] User mikey created with password mikey"
 
                 # ── 5. Ngrok Tunnel ───────────────────────────────────────────────────
       - name: Configure and Start Tunnel (Bore Free / Ngrok)
@@ -216,8 +220,8 @@ jobs:
           if ($tunnelUrl) {
             Write-Output "============================================"
             Write-Output " [+] RDP Address : $tunnelUrl"
-            Write-Output " [+] Username    : VEXOR"
-            Write-Output " [+] Password    : VEXOR@2026"
+            Write-Output " [+] Username    : mikey"
+            Write-Output " [+] Password    : mikey"
             Write-Output "============================================"
             echo "tunnel_url=$tunnelUrl" >> $env:GITHUB_OUTPUT
             echo "TUNNEL_HOST=$tunnelUrl" >> $env:GITHUB_ENV
@@ -675,7 +679,7 @@ jobs:
             try { powershell -NoProfile -ExecutionPolicy Bypass -File "C:\sync_delta_apps.ps1" -ChainId $env:CHAIN_ID } catch {}
           }
           # Fallback trigger if keep-alive exited abnormally without auto-triggering
-          if ($env:AUTO_RESTART -eq "true") {
+          if ($env:AUTO_RESTART -eq "true" -and "${{ job.status }}" -ne "cancelled") {
             $body = @{
               ref    = $env:GH_REF
               inputs = @{
@@ -721,8 +725,8 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             xfce4 xfce4-terminal xrdp xorgxrdp dbus-x11 x11-xserver-utils python3-tk curl wget nano python3-pip
 
-          echo "runner:VEXOR@2026" | sudo chpasswd
-          echo "root:VEXOR@2026"   | sudo chpasswd
+          echo "runner:mikey" | sudo chpasswd
+          echo "root:mikey"   | sudo chpasswd
           sudo adduser xrdp ssl-cert
           sudo adduser runner ssl-cert
 
@@ -750,7 +754,7 @@ jobs:
           sudo chmod +x /etc/xrdp/startwm.sh
 
           sudo sed -i '/^\[Xorg\]/,/^\[/ s/^username=.*/username=runner/' /etc/xrdp/xrdp.ini
-          sudo sed -i '/^\[Xorg\]/,/^\[/ s/^password=.*/password=VEXOR@2026/' /etc/xrdp/xrdp.ini
+          sudo sed -i '/^\[Xorg\]/,/^\[/ s/^password=.*/password=mikey/' /etc/xrdp/xrdp.ini
           echo "TARGET_PORT=3389" >> $GITHUB_ENV
 
                 # ── 2. Kali Tools (GUI variant) ───────────────────────────────────────
@@ -772,7 +776,7 @@ jobs:
           echo "   VEXOR LINUX OFFENSIVE SUITE"
           echo "============================================================"
           echo "  [+] User       : runner / root"
-          echo "  [+] Password   : VEXOR@2026"
+          echo "  [+] Password   : mikey"
           echo "  [+] Wordlists  : /usr/share/wordlists/rockyou.txt"
           echo "------------------------------------------------------------"
           echo "  Network  : nmap, wireshark, tshark, netcat, tcpdump"
@@ -804,8 +808,8 @@ jobs:
       - name: Setup Native Ubuntu VPS SSH
         if: "(startsWith(inputs.windows_version, 'ubuntu') || startsWith(inputs.windows_version, 'ubuntu2')) && !contains(inputs.windows_version, '-gui')"
         run: |
-          echo "root:VEXOR@2026"   | sudo chpasswd
-          echo "runner:VEXOR@2026" | sudo chpasswd
+          echo "root:mikey"   | sudo chpasswd
+          echo "runner:mikey" | sudo chpasswd
           sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
           sudo sed -i 's/PermitRootLogin no/PermitRootLogin yes/'                 /etc/ssh/sshd_config
           sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/'   /etc/ssh/sshd_config
@@ -814,7 +818,7 @@ jobs:
           cat >> /home/runner/.bashrc << 'EOF'
           echo "========================================"
           echo "  VEXOR Ubuntu VPS"
-          echo "  User: runner / root | Pass: VEXOR@2026"
+          echo "  User: runner / root | Pass: mikey"
           echo "========================================"
           EOF
           echo "TARGET_PORT=22" >> $GITHUB_ENV
@@ -826,7 +830,7 @@ jobs:
           TARGET_OS="${{ inputs.windows_version }}"
           DOCKER_IMG="debian:12"
 
-          # Write setup script based on distro (all use VEXOR@2026)
+          # Write setup script based on distro (all use mikey)
           if [[ "$TARGET_OS" =~ ^debian ]]; then
             DOCKER_IMG="debian:12"
             cat > /tmp/setup.sh << 'VXEOF'
@@ -834,9 +838,9 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server sudo curl wget nano bash procps passwd
           mkdir -p /var/run/sshd /etc/ssh/sshd_config.d
-          echo 'root:VEXOR@2026' | chpasswd
+          echo 'root:mikey' | chpasswd
           useradd -m -s /bin/bash runner
-          echo 'runner:VEXOR@2026' | chpasswd
+          echo 'runner:mikey' | chpasswd
           usermod -aG sudo runner
           echo 'runner ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
           sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
@@ -855,9 +859,9 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server sudo curl wget nano bash procps passwd nmap netcat-traditional
           mkdir -p /var/run/sshd /etc/ssh/sshd_config.d
-          echo 'root:VEXOR@2026' | chpasswd
+          echo 'root:mikey' | chpasswd
           useradd -m -s /bin/bash runner
-          echo 'runner:VEXOR@2026' | chpasswd
+          echo 'runner:mikey' | chpasswd
           usermod -aG sudo runner
           echo 'runner ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
           sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
@@ -877,9 +881,9 @@ jobs:
           apk add --no-cache openssh bash sudo curl wget nano procps shadow
           ssh-keygen -A
           mkdir -p /etc/ssh/sshd_config.d
-          echo 'root:VEXOR@2026' | chpasswd
+          echo 'root:mikey' | chpasswd
           adduser -D -s /bin/bash runner
-          echo 'runner:VEXOR@2026' | chpasswd
+          echo 'runner:mikey' | chpasswd
           echo 'runner ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
           echo 'PermitRootLogin yes'            > /etc/ssh/sshd_config.d/01-auth.conf
           echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config.d/01-auth.conf
@@ -896,9 +900,9 @@ jobs:
           pacman -Sy --noconfirm openssh sudo curl wget nano bash procps-ng shadow
           ssh-keygen -A
           mkdir -p /etc/ssh/sshd_config.d
-          echo 'root:VEXOR@2026' | chpasswd
+          echo 'root:mikey' | chpasswd
           useradd -m -s /bin/bash runner
-          echo 'runner:VEXOR@2026' | chpasswd
+          echo 'runner:mikey' | chpasswd
           echo 'runner ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
           sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
           echo 'PermitRootLogin yes'            > /etc/ssh/sshd_config.d/01-auth.conf
@@ -915,9 +919,9 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False --nodocs openssh-server passwd sudo curl wget nano bash procps-ng
           ssh-keygen -A
           mkdir -p /etc/ssh/sshd_config.d
-          echo 'root:VEXOR@2026' | chpasswd
+          echo 'root:mikey' | chpasswd
           useradd -m -s /bin/bash runner
-          echo 'runner:VEXOR@2026' | chpasswd
+          echo 'runner:mikey' | chpasswd
           usermod -aG wheel runner
           echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
           sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
@@ -937,9 +941,9 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False --nodocs openssh-server passwd sudo curl wget nano bash procps-ng
           ssh-keygen -A
           mkdir -p /etc/ssh/sshd_config.d
-          echo 'root:VEXOR@2026' | chpasswd
+          echo 'root:mikey' | chpasswd
           useradd -m -s /bin/bash runner
-          echo 'runner:VEXOR@2026' | chpasswd
+          echo 'runner:mikey' | chpasswd
           usermod -aG wheel runner
           echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
           sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd 2>/dev/null || true
@@ -1065,7 +1069,7 @@ jobs:
            SSH Host : $host
            SSH Port : $sshport
            User     : runner
-           Password : VEXOR@2026
+           Password : mikey
           
            Command  : ssh runner@$host -p $sshport
           ============================================
@@ -1413,7 +1417,7 @@ jobs:
             /home/runner/sync_delta.sh "$CHAIN_ID" 2>/dev/null || true
           fi
           # Fallback trigger
-          if [ "$AUTO_RESTART" = "true" ]; then
+          if [ "$AUTO_RESTART" = "true" ] && [ "${{ job.status }}" != "cancelled" ]; then
             BODY=$(python3 -c "
           import json
           print(json.dumps({
