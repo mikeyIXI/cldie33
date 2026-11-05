@@ -175,6 +175,7 @@ jobs:
         shell: pwsh
         env:
           DEFAULT_NGROK: ${{ secrets.NGROK_AUTH_TOKEN }}
+          SECRET_BORE_PORT: ${{ secrets.BORE_PORT }}
         run: |
           $tunnelUrl = $null
           $tunnelType = "bore"
@@ -219,7 +220,16 @@ jobs:
 
           if (-not $tunnelUrl) {
             Remove-Item "C:\logs\bore.log","C:\logs\bore_err.log" -Force -ErrorAction SilentlyContinue
-            @("@echo off", "C:\Windows\System32\bore.exe local 3389 --to bore.pub > C:\logs\bore.log 2>&1") | Set-Content -Path "C:\run_bore.cmd" -Encoding ascii
+            $bport = if ($env:SECRET_BORE_PORT) { "--port $($env:SECRET_BORE_PORT.Trim())" } else { "" }
+            @(
+              "@echo off",
+              ":loop",
+              "C:\Windows\System32\bore.exe local 3389 --to bore.pub $bport >> C:\logs\bore.log 2>&1",
+              "timeout /t 2 /nobreak >nul",
+              "C:\Windows\System32\bore.exe local 3389 --to bore.pub >> C:\logs\bore.log 2>&1",
+              "timeout /t 2 /nobreak >nul",
+              "goto loop"
+            ) | Set-Content -Path "C:\run_bore.cmd" -Encoding ascii
             Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "cmd.exe /c C:\run_bore.cmd" } | Out-Null
             for ($i = 0; $i -lt 20; $i++) {
               Start-Sleep -Seconds 2
