@@ -20,7 +20,7 @@ concurrency:
 jobs:
   zorin-rdp:
     name: Run Zorin OS Desktop
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     steps:
@@ -39,15 +39,22 @@ jobs:
           # Prevent interactive prompts
           export DEBIAN_FRONTEND=noninteractive
 
+          # Disable any conflicting remote desktop services
+          sudo systemctl stop gnome-remote-desktop 2>/dev/null || true
+          sudo systemctl disable gnome-remote-desktop 2>/dev/null || true
+          sudo systemctl mask gnome-remote-desktop 2>/dev/null || true
+
           # Update apt
           sudo apt-get update -y
 
-          # Install XRDP, Xorg XRDP, XFCE4 desktop and essential tools
+          # Install XRDP, TigerVNC (Xvnc virtual framebuffer backend), XFCE4 desktop and essential tools
           sudo apt-get install -y --no-install-recommends \
             xrdp \
             xorgxrdp \
-            xserver-xorg-core \
             tigervnc-standalone-server \
+            tigervnc-common \
+            xserver-xorg-core \
+            xserver-xorg-video-dummy \
             xfce4 \
             xfce4-goodies \
             xfce4-terminal \
@@ -80,7 +87,6 @@ jobs:
           if [ -d "/tmp/zorin-icons" ]; then
             sudo cp -r /tmp/zorin-icons/ZorinBlue-Dark* /usr/share/icons/ || true
             sudo cp -r /tmp/zorin-icons/ZorinBlue-Light* /usr/share/icons/ || true
-            # Update icon cache
             gtk-update-icon-cache /usr/share/icons/ZorinBlue-Dark || true
           fi
 
@@ -119,21 +125,16 @@ jobs:
           ResultActive=yes
           EOF
 
-          # Configure ~/.xsession with dbus-launch
+          # Configure ~/.xsession
           for u in mikey runner; do
             UHOME="/home/$u"
-            cat << 'EOF' | sed 's/^[ \t]*//' | sudo tee "$UHOME/.xsession"
-            export DESKTOP_SESSION=xfce
-            export XDG_SESSION_DESKTOP=xfce
-            export XDG_CURRENT_DESKTOP=XFCE
-            exec dbus-launch --exit-with-session startxfce4
-          EOF
+            echo "xfce4-session" | sudo tee "$UHOME/.xsession"
             sudo chmod 755 "$UHOME"
             sudo chmod +x "$UHOME/.xsession"
             sudo chown -R $u:$u "$UHOME"
           done
 
-          # Completely replace /etc/xrdp/startwm.sh to cleanly launch XFCE with dbus
+          # Configure /etc/xrdp/startwm.sh
           cat << 'EOF' | sed 's/^[ \t]*//' | sudo tee /etc/xrdp/startwm.sh
           #!/bin/sh
           if [ -r /etc/default/locale ]; then
@@ -141,13 +142,11 @@ jobs:
             export LANG LANGUAGE
           fi
 
-          export DESKTOP_SESSION=xfce
-          export XDG_SESSION_DESKTOP=xfce
-          export XDG_CURRENT_DESKTOP=XFCE
           unset DBUS_SESSION_BUS_ADDRESS
           unset XDG_RUNTIME_DIR
 
-          exec dbus-launch --exit-with-session startxfce4
+          test -x /etc/X11/Xsession && exec /etc/X11/Xsession
+          exec /bin/sh /etc/X11/Xsession
           EOF
           sudo chmod +x /etc/xrdp/startwm.sh
 
@@ -155,7 +154,24 @@ jobs:
           echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config
           sudo chmod 644 /etc/X11/Xwrapper.config
 
-          # Set XRDP port and settings
+          # Configure xrdp.ini: make Xvnc first so it defaults to rock-solid headless virtual display
+          sudo python3 -c "
+          with open('/etc/xrdp/xrdp.ini', 'r') as f:
+              content = f.read()
+          # If [Xvnc] is present, move it before [Xorg]
+          if '[Xvnc]' in content and '[Xorg]' in content:
+              parts = content.split('[Xorg]')
+              pre_xorg = parts[0]
+              post_xorg = '[Xorg]' + parts[1]
+              vnc_parts = post_xorg.split('[Xvnc]')
+              vnc_section = '[Xvnc]' + vnc_parts[1].split('\n\n[')[0]
+              rest_after_vnc = post_xorg.replace(vnc_section, '')
+              new_content = pre_xorg + vnc_section + '\n\n' + rest_after_vnc
+              with open('/etc/xrdp/xrdp.ini', 'w') as f:
+                  f.write(new_content)
+          "
+
+          # Set XRDP port and buffer settings
           sudo sed -i 's/port=3389/port=3389/g' /etc/xrdp/xrdp.ini
           sudo sed -i 's/max_bpp=32/max_bpp=24/g' /etc/xrdp/xrdp.ini
           sudo sed -i 's/crypt_level=high/crypt_level=low/g' /etc/xrdp/xrdp.ini
