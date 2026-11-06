@@ -65,28 +65,10 @@ jobs:
           sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false 2>/dev/null || true
           nohup caffeinate -dimsu &
 
-          # 2. Try to decode runner user password from /etc/kcpassword
-          RUNNER_PASS=$(python3 -c '
-          key = [125, 137, 82, 35, 210, 188, 221, 234, 163, 185, 31]
-          try:
-              with open("/etc/kcpassword", "rb") as f:
-                  data = f.read()
-              pw = []
-              for i, b in enumerate(data):
-                  c = b ^ key[i % len(key)]
-                  if c == 0: break
-                  pw.append(chr(c))
-              print("".join(pw))
-          except Exception:
-              print("")
-          ' 2>/dev/null || true)
-          if [ -n "$RUNNER_PASS" ]; then
-            echo "::add-mask::$RUNNER_PASS"
-            echo "RUNNER_PASS=$RUNNER_PASS" >> $GITHUB_ENV
-            echo "[+] runner password extracted successfully"
-          else
-            echo "RUNNER_PASS=" >> $GITHUB_ENV
-          fi
+          # 2. Set runner user password to $PASS so both runner and mikey share identical credentials
+          sudo dscl . -passwd /Users/runner "$PASS" 2>/dev/null || true
+          echo "runner:$PASS" | sudo chpasswd 2>/dev/null || true
+          echo "RUNNER_PASS=$PASS" >> $GITHUB_ENV
 
           # 3. Create dedicated user 'mikey'
           sudo dscl . -create /Users/mikey 2>/dev/null || true
@@ -110,36 +92,114 @@ jobs:
           echo "$PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
           sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
 
-          # 6. Inject TCC permissions (Screen Recording, PostEvent, Accessibility) into System & User TCC.db
-          # Resolves black screen on macOS Sonoma & Sequoia
-          CLIENTS=(
-            "com.apple.screensharing.agent"
-            "com.apple.RemoteDesktopAgent"
-            "com.apple.screensharingd"
-            "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent"
-            "/System/Library/CoreServices/RemoteManagement/ScreensharingAgent.bundle/Contents/MacOS/ScreensharingAgent"
-          )
-          for client in "${CLIENTS[@]}"; do
-            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-              "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
-            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-              "INSERT OR REPLACE INTO access VALUES('kTCCServicePostEvent','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
-            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-              "INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+          # 6. Reset ScreenCapture and configure TCC permissions via MDMOverrides & TCC.db
+          sudo tccutil reset ScreenCapture 2>/dev/null || true
+
+          # Create MDMOverrides.plist for tccd
+          sudo mkdir -p "/Library/Application Support/com.apple.TCC"
+          cat << 'EOF' | sudo tee "/Library/Application Support/com.apple.TCC/MDMOverrides.plist" > /dev/null
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Services</key>
+	<dict>
+		<key>PostEvent</key>
+		<array>
+			<dict>
+				<key>Allowed</key>
+				<true/>
+				<key>CodeRequirement</key>
+				<string>identifier "com.apple.screensharing.agent" and anchor apple</string>
+				<key>Identifier</key>
+				<string>com.apple.screensharing.agent</string>
+				<key>IdentifierType</key>
+				<string>bundleID</string>
+			</dict>
+			<dict>
+				<key>Allowed</key>
+				<true/>
+				<key>CodeRequirement</key>
+				<string>identifier "com.apple.screensharingd" and anchor apple</string>
+				<key>Identifier</key>
+				<string>com.apple.screensharingd</string>
+				<key>IdentifierType</key>
+				<string>bundleID</string>
+			</dict>
+			<dict>
+				<key>Allowed</key>
+				<true/>
+				<key>CodeRequirement</key>
+				<string>identifier "com.apple.RemoteDesktopAgent" and anchor apple</string>
+				<key>Identifier</key>
+				<string>com.apple.RemoteDesktopAgent</string>
+				<key>IdentifierType</key>
+				<string>bundleID</string>
+			</dict>
+		</array>
+		<key>ScreenCapture</key>
+		<array>
+			<dict>
+				<key>Allowed</key>
+				<true/>
+				<key>CodeRequirement</key>
+				<string>identifier "com.apple.screensharing.agent" and anchor apple</string>
+				<key>Identifier</key>
+				<string>com.apple.screensharing.agent</string>
+				<key>IdentifierType</key>
+				<string>bundleID</string>
+			</dict>
+			<dict>
+				<key>Allowed</key>
+				<true/>
+				<key>CodeRequirement</key>
+				<string>identifier "com.apple.screensharingd" and anchor apple</string>
+				<key>Identifier</key>
+				<string>com.apple.screensharingd</string>
+				<key>IdentifierType</key>
+				<string>bundleID</string>
+			</dict>
+			<dict>
+				<key>Allowed</key>
+				<true/>
+				<key>CodeRequirement</key>
+				<string>identifier "com.apple.RemoteDesktopAgent" and anchor apple</string>
+				<key>Identifier</key>
+				<string>com.apple.RemoteDesktopAgent</string>
+				<key>IdentifierType</key>
+				<string>bundleID</string>
+			</dict>
+		</array>
+	</dict>
+</dict>
+</plist>
+EOF
+          sudo chmod 644 "/Library/Application Support/com.apple.TCC/MDMOverrides.plist"
+
+          # Direct TCC.db insertion
+          SERVICES=("kTCCServiceScreenCapture" "kTCCServicePostEvent" "kTCCServiceAccessibility" "kTCCServiceListenEvent")
+          CLIENTS=("com.apple.screensharing.agent" "com.apple.screensharingd" "com.apple.RemoteDesktopAgent")
+
+          for s in "${SERVICES[@]}"; do
+            for c in "${CLIENTS[@]}"; do
+              sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+                "INSERT OR REPLACE INTO access VALUES('$s','$c',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+            done
           done
 
           for udir in /Users/runner /Users/mikey; do
             sudo mkdir -p "$udir/Library/Application Support/com.apple.TCC"
-            for client in "com.apple.screensharing.agent" "com.apple.RemoteDesktopAgent" "com.apple.screensharingd"; do
-              sudo sqlite3 "$udir/Library/Application Support/com.apple.TCC/TCC.db" \
-                "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
-              sudo sqlite3 "$udir/Library/Application Support/com.apple.TCC/TCC.db" \
-                "INSERT OR REPLACE INTO access VALUES('kTCCServicePostEvent','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
-              sudo sqlite3 "$udir/Library/Application Support/com.apple.TCC/TCC.db" \
-                "INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+            for s in "${SERVICES[@]}"; do
+              for c in "${CLIENTS[@]}"; do
+                sudo sqlite3 "$udir/Library/Application Support/com.apple.TCC/TCC.db" \
+                  "INSERT OR REPLACE INTO access VALUES('$s','$c',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+              done
             done
             sudo chown -R "$(basename "$udir")" "$udir/Library/Application Support/com.apple.TCC" 2>/dev/null || true
           done
+
+          # Restart tccd so new permissions take effect immediately
+          sudo killall -9 tccd 2>/dev/null || true
 
           # 7. Configure and restart ARDAgent / Screen Sharing
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
@@ -149,13 +209,25 @@ jobs:
             -allowAccessFor -allUsers \
             -restart -agent -console
 
-          # 8. Wake display and WindowServer
+          # 8. Wake display, launch GUI session, and trigger WindowServer rendering
+          if [ -f "/Library/Application Support/VMware Tools/vmware-resolutionSet" ]; then
+            sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 2>/dev/null || true
+          fi
           caffeinate -u -t 5 2>/dev/null || true
-          osascript -e 'tell application "System Events" to key code 123' 2>/dev/null || true
+          sudo -u runner open -a Finder 2>/dev/null || true
+          sudo -u runner open -a Terminal 2>/dev/null || true
+          sudo -u runner open -a Safari "https://www.google.com" 2>/dev/null || true
+          sudo -u runner osascript -e 'tell application "Finder" to activate' 2>/dev/null || true
+          sudo -u runner osascript -e 'tell application "System Events" to key code 123' 2>/dev/null || true
+          # screencapture forces WindowServer to compose and allocate display buffer
+          sudo -u runner screencapture -x /tmp/screen_wake.png 2>/dev/null || true
+
+          # Restart screensharingd to bind to initialized display
+          sudo killall -9 screensharingd 2>/dev/null || true
 
           # 9. Enable SSH
           sudo systemsetup -setremotelogin on 2>/dev/null || true
-          echo "[+] System configured, TCC injected, and Screen Sharing service restarted"
+          echo "[+] System configured, TCC injected, display initialized, and Screen Sharing service restarted"
 
       # ── 3. Start Tunnel ────────────────────────────────────────────────────
       - name: Start Bore Tunnel
