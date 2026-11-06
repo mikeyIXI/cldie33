@@ -98,82 +98,82 @@ jobs:
           # Create MDMOverrides.plist for tccd
           sudo mkdir -p "/Library/Application Support/com.apple.TCC"
           cat << 'EOF' | sudo tee "/Library/Application Support/com.apple.TCC/MDMOverrides.plist" > /dev/null
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Services</key>
-	<dict>
-		<key>PostEvent</key>
-		<array>
-			<dict>
-				<key>Allowed</key>
-				<true/>
-				<key>CodeRequirement</key>
-				<string>identifier "com.apple.screensharing.agent" and anchor apple</string>
-				<key>Identifier</key>
-				<string>com.apple.screensharing.agent</string>
-				<key>IdentifierType</key>
-				<string>bundleID</string>
-			</dict>
-			<dict>
-				<key>Allowed</key>
-				<true/>
-				<key>CodeRequirement</key>
-				<string>identifier "com.apple.screensharingd" and anchor apple</string>
-				<key>Identifier</key>
-				<string>com.apple.screensharingd</string>
-				<key>IdentifierType</key>
-				<string>bundleID</string>
-			</dict>
-			<dict>
-				<key>Allowed</key>
-				<true/>
-				<key>CodeRequirement</key>
-				<string>identifier "com.apple.RemoteDesktopAgent" and anchor apple</string>
-				<key>Identifier</key>
-				<string>com.apple.RemoteDesktopAgent</string>
-				<key>IdentifierType</key>
-				<string>bundleID</string>
-			</dict>
-		</array>
-		<key>ScreenCapture</key>
-		<array>
-			<dict>
-				<key>Allowed</key>
-				<true/>
-				<key>CodeRequirement</key>
-				<string>identifier "com.apple.screensharing.agent" and anchor apple</string>
-				<key>Identifier</key>
-				<string>com.apple.screensharing.agent</string>
-				<key>IdentifierType</key>
-				<string>bundleID</string>
-			</dict>
-			<dict>
-				<key>Allowed</key>
-				<true/>
-				<key>CodeRequirement</key>
-				<string>identifier "com.apple.screensharingd" and anchor apple</string>
-				<key>Identifier</key>
-				<string>com.apple.screensharingd</string>
-				<key>IdentifierType</key>
-				<string>bundleID</string>
-			</dict>
-			<dict>
-				<key>Allowed</key>
-				<true/>
-				<key>CodeRequirement</key>
-				<string>identifier "com.apple.RemoteDesktopAgent" and anchor apple</string>
-				<key>Identifier</key>
-				<string>com.apple.RemoteDesktopAgent</string>
-				<key>IdentifierType</key>
-				<string>bundleID</string>
-			</dict>
-		</array>
-	</dict>
-</dict>
-</plist>
-EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>Services</key>
+          	<dict>
+          		<key>PostEvent</key>
+          		<array>
+          			<dict>
+          				<key>Allowed</key>
+          				<true/>
+          				<key>CodeRequirement</key>
+          				<string>identifier "com.apple.screensharing.agent" and anchor apple</string>
+          				<key>Identifier</key>
+          				<string>com.apple.screensharing.agent</string>
+          				<key>IdentifierType</key>
+          				<string>bundleID</string>
+          			</dict>
+          			<dict>
+          				<key>Allowed</key>
+          				<true/>
+          				<key>CodeRequirement</key>
+          				<string>identifier "com.apple.screensharingd" and anchor apple</string>
+          				<key>Identifier</key>
+          				<string>com.apple.screensharingd</string>
+          				<key>IdentifierType</key>
+          				<string>bundleID</string>
+          			</dict>
+          			<dict>
+          				<key>Allowed</key>
+          				<true/>
+          				<key>CodeRequirement</key>
+          				<string>identifier "com.apple.RemoteDesktopAgent" and anchor apple</string>
+          				<key>Identifier</key>
+          				<string>com.apple.RemoteDesktopAgent</string>
+          				<key>IdentifierType</key>
+          				<string>bundleID</string>
+          			</dict>
+          		</array>
+          		<key>ScreenCapture</key>
+          		<array>
+          			<dict>
+          				<key>Allowed</key>
+          				<true/>
+          				<key>CodeRequirement</key>
+          				<string>identifier "com.apple.screensharing.agent" and anchor apple</string>
+          				<key>Identifier</key>
+          				<string>com.apple.screensharing.agent</string>
+          				<key>IdentifierType</key>
+          				<string>bundleID</string>
+          			</dict>
+          			<dict>
+          				<key>Allowed</key>
+          				<true/>
+          				<key>CodeRequirement</key>
+          				<string>identifier "com.apple.screensharingd" and anchor apple</string>
+          				<key>Identifier</key>
+          				<string>com.apple.screensharingd</string>
+          				<key>IdentifierType</key>
+          				<string>bundleID</string>
+          			</dict>
+          			<dict>
+          				<key>Allowed</key>
+          				<true/>
+          				<key>CodeRequirement</key>
+          				<string>identifier "com.apple.RemoteDesktopAgent" and anchor apple</string>
+          				<key>Identifier</key>
+          				<string>com.apple.RemoteDesktopAgent</string>
+          				<key>IdentifierType</key>
+          				<string>bundleID</string>
+          			</dict>
+          		</array>
+          	</dict>
+          </dict>
+          </plist>
+          EOF
           sudo chmod 644 "/Library/Application Support/com.apple.TCC/MDMOverrides.plist"
 
           # Direct TCC.db insertion
