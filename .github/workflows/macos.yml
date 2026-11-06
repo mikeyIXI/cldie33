@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       macos_version:
-        description: 'macOS Version (macos-14 [Sonoma], macos-15 [Sequoia], macos-13 [Ventura])'
+        description: 'macOS Version (macos-15 [Sequoia], macos-latest)'
         required: false
-        default: 'macos-14'
+        default: 'macos-15'
       password:
         description: 'Password for VNC / SSH'
         required: false
@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   macos-runner:
-    runs-on: ${{ (github.event.inputs.macos_version == 'macos-13' || github.event.inputs.macos_version == 'mac13') && 'macos-13' || (github.event.inputs.macos_version == 'macos-15' && 'macos-15' || 'macos-14') }}
+    runs-on: ${{ inputs.macos_version || 'macos-15' }}
     timeout-minutes: 360
     permissions:
       actions: write
