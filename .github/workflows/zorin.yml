@@ -46,6 +46,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             xrdp \
             xorgxrdp \
+            xserver-xorg-core \
+            tigervnc-standalone-server \
             xfce4 \
             xfce4-goodies \
             xfce4-terminal \
@@ -117,17 +119,41 @@ jobs:
           ResultActive=yes
           EOF
 
-          # Configure ~/.xsession
-          echo "xfce4-session" | sudo tee /home/mikey/.xsession
-          sudo chown mikey:mikey /home/mikey/.xsession
-          echo "xfce4-session" | sudo tee /home/runner/.xsession
-          sudo chown runner:runner /home/runner/.xsession
+          # Configure ~/.xsession with dbus-launch
+          for u in mikey runner; do
+            UHOME="/home/$u"
+            cat << 'EOF' | sed 's/^[ \t]*//' | sudo tee "$UHOME/.xsession"
+            export DESKTOP_SESSION=xfce
+            export XDG_SESSION_DESKTOP=xfce
+            export XDG_CURRENT_DESKTOP=XFCE
+            exec dbus-launch --exit-with-session startxfce4
+          EOF
+            sudo chmod 755 "$UHOME"
+            sudo chmod +x "$UHOME/.xsession"
+            sudo chown -R $u:$u "$UHOME"
+          done
 
-          # Configure XRDP startwm.sh
-          sudo sed -i '4a # Disable systemd user session for xrdp\nunset DBUS_SESSION_BUS_ADDRESS\nunset XDG_RUNTIME_DIR\n' /etc/xrdp/startwm.sh
-          sudo sed -i -e 's/test -x \/etc\/X11\/Xsession && exec \/etc\/X11\/Xsession/#test -x \/etc\/X11\/Xsession \&\& exec \/etc\/X11\/Xsession/g' /etc/xrdp/startwm.sh
-          sudo sed -i -e 's/exec \/bin\/sh \/etc\/X11\/Xsession/#exec \/bin\/sh \/etc\/X11\/Xsession/g' /etc/xrdp/startwm.sh
-          echo "exec startxfce4" | sudo tee -a /etc/xrdp/startwm.sh
+          # Completely replace /etc/xrdp/startwm.sh to cleanly launch XFCE with dbus
+          cat << 'EOF' | sed 's/^[ \t]*//' | sudo tee /etc/xrdp/startwm.sh
+          #!/bin/sh
+          if [ -r /etc/default/locale ]; then
+            . /etc/default/locale
+            export LANG LANGUAGE
+          fi
+
+          export DESKTOP_SESSION=xfce
+          export XDG_SESSION_DESKTOP=xfce
+          export XDG_CURRENT_DESKTOP=XFCE
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # Allow anybody to start Xorg
+          echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config
+          sudo chmod 644 /etc/X11/Xwrapper.config
 
           # Set XRDP port and settings
           sudo sed -i 's/port=3389/port=3389/g' /etc/xrdp/xrdp.ini
@@ -183,9 +209,10 @@ jobs:
             sudo chown -R $u:$u "$UHOME"
           done
 
-          # Restart XRDP service
-          sudo systemctl restart xrdp
-          sudo systemctl enable xrdp
+          # Restart XRDP services
+          sudo systemctl daemon-reload
+          sudo systemctl restart xrdp-sesman xrdp
+          sudo systemctl enable xrdp xrdp-sesman
 
           echo "[*] XRDP service started and listening on port 3389."
 
