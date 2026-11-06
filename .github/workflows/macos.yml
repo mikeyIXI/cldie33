@@ -56,7 +56,7 @@ jobs:
           echo "::add-mask::$PASS"
           echo "MAC_PASS=$PASS" >> $GITHUB_ENV
 
-          # 1. Prevent display & system sleep and keep display awake
+          # 1. Prevent display & system sleep
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 2>/dev/null || true
           sudo pmset -a disablesleep 1 2>/dev/null || true
           defaults -currentHost write com.apple.screensaver idleTime 0 2>/dev/null || true
@@ -65,12 +65,13 @@ jobs:
           sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false 2>/dev/null || true
           nohup caffeinate -dimsu &
 
-          # 2. Set runner user password to $PASS so both runner and mikey share identical credentials
+          # 2. Set password for runner user (the active Aqua console session)
+          sudo sysadminctl -resetPasswordFor runner -newPassword "$PASS" 2>/dev/null || true
           sudo dscl . -passwd /Users/runner "$PASS" 2>/dev/null || true
           echo "runner:$PASS" | sudo chpasswd 2>/dev/null || true
           echo "RUNNER_PASS=$PASS" >> $GITHUB_ENV
 
-          # 3. Create dedicated user 'mikey'
+          # 3. Create dedicated user 'mikey' as backup
           sudo dscl . -create /Users/mikey 2>/dev/null || true
           sudo dscl . -create /Users/mikey UserShell /bin/zsh 2>/dev/null || true
           sudo dscl . -create /Users/mikey RealName "Mikey" 2>/dev/null || true
@@ -92,10 +93,7 @@ jobs:
           echo "$PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
           sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
 
-          # 6. Reset ScreenCapture and configure TCC permissions via MDMOverrides & TCC.db
-          sudo tccutil reset ScreenCapture 2>/dev/null || true
-
-          # Create MDMOverrides.plist for tccd
+          # 6. Configure MDMOverrides.plist for TCC permissions
           sudo mkdir -p "/Library/Application Support/com.apple.TCC"
           cat << 'EOF' | sudo tee "/Library/Application Support/com.apple.TCC/MDMOverrides.plist" > /dev/null
           <?xml version="1.0" encoding="UTF-8"?>
@@ -176,9 +174,9 @@ jobs:
           EOF
           sudo chmod 644 "/Library/Application Support/com.apple.TCC/MDMOverrides.plist"
 
-          # Direct TCC.db insertion
+          # Direct TCC.db insertion for ScreenCapture & Event control
           SERVICES=("kTCCServiceScreenCapture" "kTCCServicePostEvent" "kTCCServiceAccessibility" "kTCCServiceListenEvent")
-          CLIENTS=("com.apple.screensharing.agent" "com.apple.screensharingd" "com.apple.RemoteDesktopAgent")
+          CLIENTS=("com.apple.screensharing.agent" "com.apple.screensharingd" "com.apple.RemoteDesktopAgent" "com.apple.screensharing")
 
           for s in "${SERVICES[@]}"; do
             for c in "${CLIENTS[@]}"; do
@@ -198,36 +196,17 @@ jobs:
             sudo chown -R "$(basename "$udir")" "$udir/Library/Application Support/com.apple.TCC" 2>/dev/null || true
           done
 
-          # Restart tccd so new permissions take effect immediately
-          sudo killall -9 tccd 2>/dev/null || true
-
-          # 7. Configure and restart ARDAgent / Screen Sharing
+          # 7. Configure and activate Screen Sharing via kickstart
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
-            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PASS" \
             -privs -all \
             -allowAccessFor -allUsers \
             -restart -agent -console
 
-          # 8. Wake display, launch GUI session, and trigger WindowServer rendering
-          if [ -f "/Library/Application Support/VMware Tools/vmware-resolutionSet" ]; then
-            sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 2>/dev/null || true
-          fi
-          caffeinate -u -t 5 2>/dev/null || true
-          sudo -u runner open -a Finder 2>/dev/null || true
-          sudo -u runner open -a Terminal 2>/dev/null || true
-          sudo -u runner open -a Safari "https://www.google.com" 2>/dev/null || true
-          sudo -u runner osascript -e 'tell application "Finder" to activate' 2>/dev/null || true
-          sudo -u runner osascript -e 'tell application "System Events" to key code 123' 2>/dev/null || true
-          # screencapture forces WindowServer to compose and allocate display buffer
-          sudo -u runner screencapture -x /tmp/screen_wake.png 2>/dev/null || true
-
-          # Restart screensharingd to bind to initialized display
-          sudo killall -9 screensharingd 2>/dev/null || true
-
-          # 9. Enable SSH
-          sudo systemsetup -setremotelogin on 2>/dev/null || true
-          echo "[+] System configured, TCC injected, display initialized, and Screen Sharing service restarted"
+          # 8. Enable SSH non-interactively
+          echo "yes" | sudo systemsetup -f -setremotelogin on 2>/dev/null || true
+          echo "[+] Configuration finished successfully"
 
       # ── 3. Start Tunnel ────────────────────────────────────────────────────
       - name: Start Bore Tunnel
@@ -251,24 +230,20 @@ jobs:
             echo "============================================"
             echo " [+] macOS VNC Ready : $TUNNEL_URL"
             echo " [+] Password        : $MAC_PASS"
-            echo " [+] Username        : mikey"
-            if [ -n "$RUNNER_PASS" ]; then
-              echo " [+] Runner User Pass: $RUNNER_PASS"
-            fi
+            echo " [+] Username        : runner (Console Session)"
+            echo " [+] Backup User     : mikey"
             echo "============================================"
 
             echo "### 🍎 macOS Screen Sharing (VNC) Ready" >> $GITHUB_STEP_SUMMARY
             echo "- **VNC Address**: \`$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Primary User**: \`runner\` *(المستخدم النشط لسطح المكتب)*" >> $GITHUB_STEP_SUMMARY
             echo "- **Password**: \`$MAC_PASS\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Username (if requested)**: \`mikey\`" >> $GITHUB_STEP_SUMMARY
-            if [ -n "$RUNNER_PASS" ]; then
-              echo "- **Runner Console User**: \`runner\` (Password: \`$RUNNER_PASS\`)" >> $GITHUB_STEP_SUMMARY
-            fi
+            echo "- **Backup User**: \`mikey\`" >> $GITHUB_STEP_SUMMARY
             echo "- **How to connect**:" >> $GITHUB_STEP_SUMMARY
-            echo "  - **Method 1 (Standard VNC - Recommended)**: In RealVNC Viewer, enter \`$TUNNEL_URL\`. When prompted for password, enter \`$MAC_PASS\` (leave Username empty or as default)." >> $GITHUB_STEP_SUMMARY
-            echo "  - **Method 2 (Apple Remote Desktop)**: Enter Username: \`mikey\` and Password: \`$MAC_PASS\`." >> $GITHUB_STEP_SUMMARY
-            echo "  - **From Mac**: Press \`Cmd + K\` in Finder or Safari and type \`vnc://$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
-            echo "  - **From Mobile**: Download **VNC Viewer** app and connect to \`$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - **في برنامج RealVNC Viewer**: اكتب عنوان السيرفر \`$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - **اسم المستخدم**: اكتب \`runner\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - **كلمة السر**: اكتب \`$MAC_PASS\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - *(إذا ظهر طلب كلمة سر فقط بدون اسم مستخدم، أدخل \`$MAC_PASS\` فقط)*" >> $GITHUB_STEP_SUMMARY
           else
             echo "[!] Failed to get bore tunnel"
             cat /tmp/logs/bore.log 2>/dev/null || true
@@ -281,15 +256,15 @@ jobs:
           cat << EOF > macos-vnc-info.txt
           === macOS Remote Desktop (Screen Sharing / VNC) ===
           VNC Address: ${{ env.TUNNEL_HOST }}
+          Username: runner
           Password: ${{ env.MAC_PASS }}
-          Username: mikey
-          Runner User: runner
+          Backup Username: mikey
           Connection URL: vnc://${{ env.TUNNEL_HOST }}
 
           How to connect:
-          - Method 1: RealVNC Viewer -> ${{ env.TUNNEL_HOST }} -> Password: ${{ env.MAC_PASS }}
-          - Method 2: RealVNC Viewer -> Username: mikey, Password: ${{ env.MAC_PASS }}
-          - macOS Finder: Cmd+K -> vnc://${{ env.TUNNEL_HOST }}
+          - RealVNC Viewer: Connect to ${{ env.TUNNEL_HOST }}
+          - Username: runner
+          - Password: ${{ env.MAC_PASS }}
           EOF
 
       - name: Upload Artifact
