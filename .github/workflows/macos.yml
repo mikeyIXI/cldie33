@@ -56,20 +56,37 @@ jobs:
           echo "::add-mask::$PASS"
           echo "MAC_PASS=$PASS" >> $GITHUB_ENV
 
-          # Set password for runner and root
-          echo "runner:$PASS" | sudo chpasswd 2>/dev/null || true
-          echo "root:$PASS" | sudo chpasswd 2>/dev/null || true
-          sudo dscl . -passwd /Users/runner "$PASS" 2>/dev/null || true
+          # 1. Create dedicated user 'mikey'
+          sudo dscl . -create /Users/mikey
+          sudo dscl . -create /Users/mikey UserShell /bin/zsh
+          sudo dscl . -create /Users/mikey RealName "Mikey"
+          sudo dscl . -create /Users/mikey UniqueID 1001
+          sudo dscl . -create /Users/mikey PrimaryGroupID 80
+          sudo dscl . -create /Users/mikey NFSHomeDirectory /Users/mikey
+          sudo cp -R "/System/Library/User Template/English.lproj" /Users/mikey 2>/dev/null || sudo mkdir -p /Users/mikey
+          sudo chown -R mikey:admin /Users/mikey 2>/dev/null || true
+          sudo dscl . -passwd /Users/mikey "$PASS"
 
-          # Enable Remote Management / Screen Sharing (VNC port 5900)
+          # 2. Add mikey to admin & remote access groups
+          sudo dseditgroup -o edit -a mikey -t user admin 2>/dev/null || true
+          sudo dseditgroup -o edit -a mikey -t user com.apple.access_screensharing 2>/dev/null || true
+          sudo dseditgroup -o edit -a mikey -t user com.apple.access_ssh 2>/dev/null || true
+
+          # 3. Enable Remote Management & Screen Sharing with kickstart
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
             -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PASS" \
-            -restart -agent -privs -all -allowAccessFor -allUsers
+            -users mikey \
+            -privs -all \
+            -allowAccessFor -allUsers \
+            -restart -agent -console
 
-          # Enable SSH
+          # 4. Enable auto-login for mikey so desktop session is active
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser "mikey" 2>/dev/null || true
+
+          # 5. Enable SSH
           sudo systemsetup -setremotelogin on 2>/dev/null || true
-          echo "[+] VNC Screen Sharing enabled on port 5900"
+          echo "[+] User 'mikey' created and Screen Sharing configured"
 
       # ── 3. Start Tunnel ────────────────────────────────────────────────────
       - name: Start Bore Tunnel
@@ -92,16 +109,16 @@ jobs:
             echo "::add-mask::$TUNNEL_URL"
             echo "============================================"
             echo " [+] macOS VNC Ready : $TUNNEL_URL"
-            echo " [+] Username        : runner"
+            echo " [+] Username        : mikey"
             echo " [+] Password        : $MAC_PASS"
             echo "============================================"
 
             echo "### 🍎 macOS Screen Sharing (VNC) Ready" >> $GITHUB_STEP_SUMMARY
             echo "- **VNC Address**: \`$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **User**: \`runner\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Username**: \`mikey\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Password**: \`$MAC_PASS\`" >> $GITHUB_STEP_SUMMARY
             echo "- **How to connect**:" >> $GITHUB_STEP_SUMMARY
-            echo "  - **From Windows**: Use RealVNC Viewer, TightVNC, or TigerVNC (Address: \`$TUNNEL_URL\`, Password: \`$MAC_PASS\`)" >> $GITHUB_STEP_SUMMARY
+            echo "  - **From Windows**: Use RealVNC Viewer, TightVNC, or TigerVNC (Address: \`$TUNNEL_URL\`, Username: \`mikey\`, Password: \`$MAC_PASS\`)" >> $GITHUB_STEP_SUMMARY
             echo "  - **From Mac**: Press \`Cmd + K\` in Finder or Safari and type \`vnc://$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
             echo "  - **From iPhone/Android**: Download **VNC Viewer** app from App Store / Google Play" >> $GITHUB_STEP_SUMMARY
           else
@@ -116,12 +133,12 @@ jobs:
           cat << EOF > macos-vnc-info.txt
           === macOS Remote Desktop (Screen Sharing / VNC) ===
           VNC Address: ${{ env.TUNNEL_HOST }}
-          Username: runner
+          Username: mikey
           Password: ${{ env.MAC_PASS }}
           Connection URL: vnc://${{ env.TUNNEL_HOST }}
 
           How to connect:
-          - Windows: RealVNC, TightVNC, TigerVNC
+          - Windows: RealVNC, TightVNC, TigerVNC (Username: mikey, Password: ${{ env.MAC_PASS }})
           - macOS: Finder -> Go -> Connect to Server (Cmd+K) -> vnc://${{ env.TUNNEL_HOST }}
           - Mobile: VNC Viewer app
           EOF
