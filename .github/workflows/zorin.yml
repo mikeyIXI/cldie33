@@ -1,0 +1,314 @@
+name: Zorin OS Cloud RDP (XRDP + Bore)
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'Password for RDP (default: Mikey@2026)'
+        required: false
+        default: 'Mikey@2026'
+      auto_restart:
+        description: 'Auto-restart workflow before timeout (6h)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: vexor-zorin
+  cancel-in-progress: true
+
+jobs:
+  zorin-rdp:
+    name: Run Zorin OS Desktop
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Zorin OS Desktop Environment & XRDP
+        env:
+          RDP_PASSWORD: ${{ inputs.password || 'Mikey@2026' }}
+        run: |
+          set -e
+          echo "======================================================"
+          echo " Installing Zorin OS Desktop (XFCE + Zorin Theme) + XRDP"
+          echo "======================================================"
+
+          # Prevent interactive prompts
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Update apt
+          sudo apt-get update -y
+
+          # Install XRDP, Xorg XRDP, XFCE4 desktop and essential tools
+          sudo apt-get install -y --no-install-recommends \
+            xrdp \
+            xorgxrdp \
+            xfce4 \
+            xfce4-goodies \
+            xfce4-terminal \
+            xfce4-whiskermenu-plugin \
+            dbus-x11 \
+            x11-xserver-utils \
+            firefox \
+            curl \
+            wget \
+            git \
+            jq \
+            unzip \
+            tar \
+            htop \
+            nano
+
+          # Download and install bore tunnel client
+          curl -sL https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz | sudo tar -xz -C /usr/local/bin bore
+          sudo chmod +x /usr/local/bin/bore
+
+          # Install official Zorin OS Desktop & Icon themes
+          echo "[*] Downloading official Zorin OS themes..."
+          git clone --depth 1 https://github.com/ZorinOS/zorin-desktop-themes.git /tmp/zorin-themes || true
+          if [ -d "/tmp/zorin-themes" ]; then
+            sudo cp -r /tmp/zorin-themes/ZorinBlue-Dark* /usr/share/themes/ || true
+            sudo cp -r /tmp/zorin-themes/ZorinBlue-Light* /usr/share/themes/ || true
+          fi
+
+          git clone --depth 1 https://github.com/ZorinOS/zorin-icon-themes.git /tmp/zorin-icons || true
+          if [ -d "/tmp/zorin-icons" ]; then
+            sudo cp -r /tmp/zorin-icons/ZorinBlue-Dark* /usr/share/icons/ || true
+            sudo cp -r /tmp/zorin-icons/ZorinBlue-Light* /usr/share/icons/ || true
+            # Update icon cache
+            gtk-update-icon-cache /usr/share/icons/ZorinBlue-Dark || true
+          fi
+
+          # Setup users: 'mikey' and 'runner'
+          echo "[*] Setting up users..."
+          if ! id "mikey" &>/dev/null; then
+            sudo useradd -m -s /bin/bash -G sudo,adm,audio,video mikey
+          fi
+          echo "mikey:$RDP_PASSWORD" | sudo chpasswd
+          echo "runner:$RDP_PASSWORD" | sudo chpasswd
+
+          # Sudoers without password
+          echo "mikey ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/mikey
+          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner
+
+          # Fix XRDP permissions
+          sudo adduser xrdp ssl-cert || true
+          sudo adduser mikey ssl-cert || true
+          sudo adduser runner ssl-cert || true
+
+          # Configure polkit to suppress authentication popups inside RDP session
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d/
+          sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla << 'EOF'
+          [Allow Colord all Users]
+          Identity=unix-user:*
+          Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
+          ResultAny=no
+          ResultInactive=no
+          ResultActive=yes
+
+          [Allow PackageKit all Users]
+          Identity=unix-user:*
+          Action=org.freedesktop.packagekit.system-sources-refresh;org.freedesktop.packagekit.system-network-proxy-configure
+          ResultAny=no
+          ResultInactive=no
+          ResultActive=yes
+          EOF
+
+          # Configure ~/.xsession
+          echo "xfce4-session" | sudo tee /home/mikey/.xsession
+          sudo chown mikey:mikey /home/mikey/.xsession
+          echo "xfce4-session" | sudo tee /home/runner/.xsession
+          sudo chown runner:runner /home/runner/.xsession
+
+          # Configure XRDP startwm.sh
+          sudo sed -i '4a # Disable systemd user session for xrdp\nunset DBUS_SESSION_BUS_ADDRESS\nunset XDG_RUNTIME_DIR\n' /etc/xrdp/startwm.sh
+          sudo sed -i -e 's/test -x \/etc\/X11\/Xsession && exec \/etc\/X11\/Xsession/#test -x \/etc\/X11\/Xsession \&\& exec \/etc\/X11\/Xsession/g' /etc/xrdp/startwm.sh
+          sudo sed -i -e 's/exec \/bin\/sh \/etc\/X11\/Xsession/#exec \/bin\/sh \/etc\/X11\/Xsession/g' /etc/xrdp/startwm.sh
+          echo "exec startxfce4" | sudo tee -a /etc/xrdp/startwm.sh
+
+          # Set XRDP port and settings
+          sudo sed -i 's/port=3389/port=3389/g' /etc/xrdp/xrdp.ini
+          sudo sed -i 's/max_bpp=32/max_bpp=24/g' /etc/xrdp/xrdp.ini
+          sudo sed -i 's/crypt_level=high/crypt_level=low/g' /etc/xrdp/xrdp.ini
+
+          # Configure XFCE Zorin Theme for mikey and runner
+          for u in mikey runner; do
+            UHOME="/home/$u"
+            sudo mkdir -p "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml"
+            sudo tee "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" << 'XSET'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xsettings" version="1.0">
+            <property name="Net" type="empty">
+              <property name="ThemeName" type="string" value="ZorinBlue-Dark"/>
+              <property name="IconThemeName" type="string" value="ZorinBlue-Dark"/>
+              <property name="CursorThemeName" type="string" value="DMZ-White"/>
+              <property name="EnableEventSounds" type="bool" value="false"/>
+              <property name="EnableInputFeedbackSounds" type="bool" value="false"/>
+            </property>
+            <property name="Gtk" type="empty">
+              <property name="FontName" type="string" value="Sans 10"/>
+              <property name="MonospaceFontName" type="string" value="Monospace 10"/>
+              <property name="CursorThemeName" type="string" value="DMZ-White"/>
+              <property name="CursorThemeSize" type="int" value="24"/>
+              <property name="DecorationLayout" type="string" value="close,maximize,minimize:"/>
+            </property>
+          </channel>
+          XSET
+
+            sudo tee "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" << 'XFWM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfwm4" version="1.0">
+            <property name="general" type="empty">
+              <property name="theme" type="string" value="ZorinBlue-Dark"/>
+              <property name="title_font" type="string" value="Sans Bold 9"/>
+              <property name="button_layout" type="string" value="O|HMC"/>
+            </property>
+          </channel>
+          XFWM
+
+            # Create desktop shortcuts for Firefox & Terminal
+            sudo mkdir -p "$UHOME/Desktop"
+            if [ -f "/usr/share/applications/firefox.desktop" ]; then
+              sudo cp /usr/share/applications/firefox.desktop "$UHOME/Desktop/"
+              sudo chmod +x "$UHOME/Desktop/firefox.desktop"
+            fi
+            if [ -f "/usr/share/applications/xfce4-terminal.desktop" ]; then
+              sudo cp /usr/share/applications/xfce4-terminal.desktop "$UHOME/Desktop/"
+              sudo chmod +x "$UHOME/Desktop/xfce4-terminal.desktop"
+            fi
+
+            sudo chown -R $u:$u "$UHOME"
+          done
+
+          # Restart XRDP service
+          sudo systemctl restart xrdp
+          sudo systemctl enable xrdp
+
+          echo "[*] XRDP service started and listening on port 3389."
+
+      - name: Start Bore Tunnel & Expose RDP
+        id: tunnel
+        run: |
+          echo "[*] Starting Bore reverse tunnel on port 3389..."
+          
+          # Launch bore in a persistent loop in the background
+          cat << 'EOF' > /tmp/run_bore.sh
+          #!/bin/bash
+          while true; do
+            bore local 3389 --to bore.pub >> /tmp/bore.log 2>&1
+            sleep 2
+          done
+          EOF
+          chmod +x /tmp/run_bore.sh
+          nohup /tmp/run_bore.sh > /dev/null 2>&1 &
+
+          # Wait for bore to establish tunnel and capture port
+          TUNNEL=""
+          for i in {1..25}; do
+            sleep 2
+            if [ -f /tmp/bore.log ]; then
+              PORT=$(grep -oE "listening at bore\.pub:[0-9]+" /tmp/bore.log | tail -n1 | cut -d':' -f2)
+              if [ -n "$PORT" ]; then
+                TUNNEL="bore.pub:$PORT"
+                echo "Found bore tunnel: $TUNNEL"
+                break
+              fi
+            fi
+            echo "Waiting for bore tunnel (attempt $i/25)..."
+          done
+
+          if [ -z "$TUNNEL" ]; then
+            echo "[!] Failed to get bore tunnel. Bore log:"
+            cat /tmp/bore.log || true
+            exit 1
+          fi
+
+          echo "TUNNEL_ADDRESS=$TUNNEL" >> $GITHUB_ENV
+          echo "tunnel=$TUNNEL" >> $GITHUB_OUTPUT
+
+          # Prepare Connection Card in Summary
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          # 🚀 Zorin OS Cloud RDP Ready!
+
+          | Item | Value |
+          |---|---|
+          | **OS** | Zorin OS (XFCE4 Dark Theme) |
+          | **RDP Address** | \`$TUNNEL\` |
+          | **Primary Username** | \`mikey\` |
+          | **Fallback Username** | \`runner\` |
+          | **Password** | \`${{ inputs.password || 'Mikey@2026' }}\` |
+          | **Client App** | Windows Remote Desktop (\`mstsc.exe\`) |
+
+          ### 📌 How to Connect:
+          1. Press **Win + R**, type **\`mstsc\`**, and press Enter.
+          2. In the Computer field, enter: **\`$TUNNEL\`**
+          3. Click **Connect**.
+          4. When prompted, enter Username: **\`mikey\`** and Password: **\`${{ inputs.password || 'Mikey@2026' }}\`**
+          5. Enjoy your fast Zorin OS desktop!
+          EOF
+
+          # Create artifact file
+          mkdir -p ./rdp_info
+          cat << EOF > ./rdp_info/connection.txt
+          ZORIN OS CLOUD RDP CONNECTION DETAILS
+          =======================================
+          RDP Host/Address: $TUNNEL
+          Username:         mikey
+          Alternative User: runner
+          Password:         ${{ inputs.password || 'Mikey@2026' }}
+          Protocol:         RDP (Standard Remote Desktop)
+          Client:           mstsc.exe (Windows Remote Desktop Connection)
+          =======================================
+          EOF
+
+          echo "============================================"
+          echo " [+] RDP IS LIVE AT: $TUNNEL"
+          echo " [+] User          : mikey"
+          echo " [+] Password      : ${{ inputs.password || 'Mikey@2026' }}"
+          echo "============================================"
+
+      - name: Upload Connection Details Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zorin-RDP-Details
+          path: ./rdp_info/connection.txt
+
+      - name: Keep-Alive Loop (Up to 6 Hours)
+        run: |
+          echo "[*] Server is now running. Press Ctrl+C or cancel workflow to stop."
+          START_TIME=$(date +%s)
+          # Run for 345 minutes (approx 5.75 hours)
+          MAX_SECONDS=$(( 345 * 60 ))
+
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$(( CURRENT_TIME - START_TIME ))
+            REMAINING=$(( MAX_SECONDS - ELAPSED ))
+            
+            if [ $REMAINING -le 0 ]; then
+              echo "[*] Max execution time reached. Exiting."
+              break
+            fi
+
+            MINS_LEFT=$(( REMAINING / 60 ))
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] RDP Active: $TUNNEL_ADDRESS | Time remaining: ${MINS_LEFT} minutes"
+            
+            # Check if XRDP is still alive
+            if ! systemctl is-active --quiet xrdp; then
+              echo "[!] Warning: XRDP not active, restarting..."
+              sudo systemctl restart xrdp || true
+            fi
+
+            sleep 60
+          done
+
+      - name: Auto-Restart Workflow
+        if: ${{ inputs.auto_restart == true && !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[*] Triggering automatic restart of Zorin OS workflow..."
+          gh workflow run zorin.yml -f password="${{ inputs.password || 'Mikey@2026' }}" -f auto_restart=true || true
