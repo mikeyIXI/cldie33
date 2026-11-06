@@ -34,11 +34,11 @@ on:
   workflow_dispatch:
     inputs:
       windows_version:
-        description: 'Server OS (windows-2025 [Win 11], windows-2022 [Win 10], or Linux)'
+        description: 'Server OS: windows-2025 (Win 11), macos-14 (Mac VNC), ubuntu-gui, arch, etc.'
         required: false
         default: 'windows-2025'
       rdp_password:
-        description: 'RDP Password (default: Mikey@2026)'
+        description: 'Password for RDP / VNC / SSH (default: Mikey@2026)'
         required: false
         default: 'Mikey@2026'
       ram_size:
@@ -1471,29 +1471,139 @@ jobs:
           if [ -n "$CHAIN_ID" ]; then
             /home/runner/sync_delta.sh "$CHAIN_ID" 2>/dev/null || true
           fi
-          # Fallback trigger
-          if [ "$AUTO_RESTART" = "true" ] && [ "${{ job.status }}" != "cancelled" ]; then
-            BODY=$(python3 -c "
-          import json
-          print(json.dumps({
-              'ref': '$GH_REF',
-              'inputs': {
-                  'windows_version': '$WIN_VERSION',
-                  'ram_size': '$RAM_SIZE',
-                  'ngrok_token': '$NGROK_TOKEN',
-                  'ngrok_region': '$NGROK_REGION',
-                  'chain_id': '$CHAIN_ID',
-                  'auto_restart': 'true'
-              }
-          }))
-          ")
-            curl -s -X POST \
-              -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/$GH_REPO/actions/workflows/main.yml/dispatches" \
-              -d "$BODY" || true
-            echo "[+] Fallback trigger sent from cleanup."
+          pkill -f bore 2>/dev/null || true
+          pkill -f ngrok 2>/dev/null || true
+
+# ─── MACOS JOB (VNC SCREEN SHARING & SSH) ────────────────────────────────────
+  macos-setup:
+    if: startsWith(github.event.inputs.windows_version, 'mac')
+    runs-on: ${{ (github.event.inputs.windows_version == 'macos-13' || github.event.inputs.windows_version == 'mac13') && 'macos-13' || (github.event.inputs.windows_version == 'macos-15' && 'macos-15' || 'macos-14') }}
+    timeout-minutes: 360
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      # ── 1. Download Bore ───────────────────────────────────────────────────
+      - name: Download Bore Tunnel
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            curl -fsSL "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-aarch64-apple-darwin.tar.gz" -o bore.tar.gz
+          else
+            curl -fsSL "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-apple-darwin.tar.gz" -o bore.tar.gz
           fi
-          pkill bore 2>/dev/null || true
-          pkill ngrok 2>/dev/null || true
+          tar -xzf bore.tar.gz
+          sudo mv bore /usr/local/bin/bore
+          sudo chmod +x /usr/local/bin/bore
+          rm -f bore.tar.gz
+          echo "[+] Bore installed for $ARCH"
+
+      # ── 2. Configure Password & System ────────────────────────────────────
+      - name: Configure User and Remote Access
+        env:
+          RDP_SECRET_PASS: ${{ secrets.RDP_PASS }}
+        run: |
+          PASS="${{ inputs.rdp_password }}"
+          PASS=$(echo "$PASS" | xargs)
+          [ -z "$PASS" ] && PASS="${RDP_SECRET_PASS}"
+          [ -z "$PASS" ] && PASS="Mikey@2026"
+          echo "::add-mask::$PASS"
+          echo "MAC_PASS=$PASS" >> $GITHUB_ENV
+
+          # Set password for runner and root
+          echo "runner:$PASS" | sudo chpasswd 2>/dev/null || true
+          echo "root:$PASS" | sudo chpasswd 2>/dev/null || true
+          sudo dscl . -passwd /Users/runner "$PASS" 2>/dev/null || true
+
+          # Enable Remote Management / Screen Sharing (VNC port 5900)
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PASS" \
+            -restart -agent -privs -all -allowAccessFor -allUsers
+
+          # Enable SSH
+          sudo systemsetup -setremotelogin on 2>/dev/null || true
+          echo "[+] VNC Screen Sharing enabled on port 5900"
+
+      # ── 3. Start Tunnel ────────────────────────────────────────────────────
+      - name: Start Bore Tunnel
+        run: |
+          mkdir -p /tmp/logs
+          rm -f /tmp/logs/bore.log
+          nohup /usr/local/bin/bore local 5900 --to bore.pub > /tmp/logs/bore.log 2>&1 &
+
+          TUNNEL_URL=""
+          for i in $(seq 1 25); do
+            sleep 2
+            if grep -q "bore.pub:[0-9]" /tmp/logs/bore.log 2>/dev/null; then
+              TUNNEL_URL=$(grep -oE "bore\.pub:[0-9]+" /tmp/logs/bore.log | head -n 1)
+              break
+            fi
+          done
+
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "TUNNEL_HOST=$TUNNEL_URL" >> $GITHUB_ENV
+            echo "::add-mask::$TUNNEL_URL"
+            echo "============================================"
+            echo " [+] macOS VNC Ready : $TUNNEL_URL"
+            echo " [+] Username        : runner"
+            echo " [+] Password        : $MAC_PASS"
+            echo "============================================"
+
+            echo "### 🍎 macOS Screen Sharing (VNC) Ready" >> $GITHUB_STEP_SUMMARY
+            echo "- **VNC Address**: \`$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **User**: \`runner\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Password**: \`$MAC_PASS\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **How to connect**:" >> $GITHUB_STEP_SUMMARY
+            echo "  - **From Windows**: Use RealVNC, TightVNC, TigerVNC, or UltraVNC (Address: \`$TUNNEL_URL\`, Password: \`$MAC_PASS\`)" >> $GITHUB_STEP_SUMMARY
+            echo "  - **From Mac**: Open Safari/Finder and type \`vnc://$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - **From iPhone/Android**: Use the free VNC Viewer or Jump Desktop app" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "[!] Failed to get bore tunnel"
+            cat /tmp/logs/bore.log 2>/dev/null || true
+            exit 1
+          fi
+
+      # ── 4. Build and Upload Connection Artifact ────────────────────────────
+      - name: Build Connection Info
+        run: |
+          cat << EOF > macos-vnc-info.txt
+          === macOS Remote Desktop (Screen Sharing / VNC) ===
+          VNC Address: ${{ env.TUNNEL_HOST }}
+          Username: runner
+          Password: ${{ env.MAC_PASS }}
+          Connection URL: vnc://${{ env.TUNNEL_HOST }}
+
+          Connect using any VNC client (RealVNC Viewer, TightVNC, TigerVNC).
+          On macOS, simply press Cmd+K in Finder and paste: vnc://${{ env.TUNNEL_HOST }}
+          EOF
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-connection
+          path: macos-vnc-info.txt
+          retention-days: 1
+
+      # ── 5. Keep Alive Session ──────────────────────────────────────────────
+      - name: Keep Alive macOS Session
+        run: |
+          echo "[+] macOS session live on ${{ env.TUNNEL_HOST }}"
+          START_TIME=$(date +%s)
+          while true; do
+            NOW=$(date +%s)
+            ELAPSED=$(( (NOW - START_TIME) / 60 ))
+            if [ $ELAPSED -ge 350 ]; then
+              echo "[*] 350 min elapsed, session limit reached."
+              break
+            fi
+            echo "[~] ${ELAPSED}m elapsed | macOS VNC Active on ${{ env.TUNNEL_HOST }}"
+            sleep 120
+          done
+
+      # ── 6. Cleanup ─────────────────────────────────────────────────────────
+      - name: Cleanup macOS
+        if: always()
+        run: |
+          pkill -f bore 2>/dev/null || true
