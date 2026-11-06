@@ -34,9 +34,13 @@ on:
   workflow_dispatch:
     inputs:
       windows_version:
-        description: 'Server OS (Windows or Linux Distros)'
+        description: 'Server OS (windows-2025 [Win 11], windows-2022 [Win 10], or Linux)'
         required: false
-        default: 'windows-2022'
+        default: 'windows-2025'
+      rdp_password:
+        description: 'RDP Password (default: Mikey@2026)'
+        required: false
+        default: 'Mikey@2026'
       ram_size:
         description: 'RAM Configuration'
         required: false
@@ -61,12 +65,12 @@ on:
 # ─── WINDOWS RDP JOB ─────────────────────────────────────────────────────────
 concurrency:
   group: vexor-rdp
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   rdp-setup:
     if: startsWith(github.event.inputs.windows_version, 'windows') || startsWith(github.event.inputs.windows_version, 'win') || github.event.inputs.windows_version == '' || github.event.inputs.windows_version == null
-    runs-on: ${{ (github.event.inputs.windows_version == 'windows-2025' || github.event.inputs.windows_version == 'win2025-ai') && 'windows-2025' || 'windows-2022' }}
+    runs-on: ${{ github.event.inputs.windows_version == 'windows-2022' && 'windows-2022' || 'windows-2025' }}
     timeout-minutes: 360
     permissions:
       actions: write
@@ -147,19 +151,31 @@ jobs:
           secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
           Remove-Item -Force C:\secpol.cfg -ErrorAction SilentlyContinue
 
-          $p = if ($env:RDP_SECRET_PASS) { $env:RDP_SECRET_PASS.Trim() } else { "Vx9#kP4mZ2026" }
+          $p = "${{ inputs.rdp_password }}".Trim()
+          if (-not $p) {
+            $p = if ($env:RDP_SECRET_PASS) { $env:RDP_SECRET_PASS.Trim() } else { "Mikey@2026" }
+          }
           Write-Output "::add-mask::$p"
           $secPass = ConvertTo-SecureString $p -AsPlainText -Force
+
+          cmd.exe /c "net user mikey `"$p`" /add /expires:never /active:yes"
+          cmd.exe /c "net user mikey `"$p`""
+          cmd.exe /c "net localgroup Administrators mikey /add"
+          cmd.exe /c "net localgroup `"Remote Desktop Users`" mikey /add"
+
           if (Get-LocalUser -Name "mikey" -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name "mikey" -Password $secPass -PasswordNeverExpires $true
             Enable-LocalUser -Name "mikey"
-          } else {
-            New-LocalUser -Name "mikey" -Password $secPass -PasswordNeverExpires -AccountNeverExpires | Out-Null
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "mikey" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "mikey" -ErrorAction SilentlyContinue
-          Set-LocalUser -Name "runneradmin" -Password $secPass -ErrorAction SilentlyContinue
-          Enable-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
+
+          cmd.exe /c "net user runneradmin `"$p`" /active:yes"
+          cmd.exe /c "net localgroup Administrators runneradmin /add"
+          cmd.exe /c "net localgroup `"Remote Desktop Users`" runneradmin /add"
+          if (Get-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "runneradmin" -Password $secPass -ErrorAction SilentlyContinue
+            Enable-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
+          }
+          echo "RDP_PASSWORD=$p" >> $env:GITHUB_ENV
 
           New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force -ErrorAction SilentlyContinue | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "VisualExperiencePolicy" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
@@ -256,13 +272,21 @@ jobs:
           if ($tunnelUrl) {
             Write-Output "::add-mask::$tunnelUrl"
             Write-Output "============================================"
-            Write-Output " [+] RDP Tunnel Ready (Protected in Artifact)"
-            Write-Output " [+] Username    : mikey"
-            Write-Output " [+] Password    : [Stored in GitHub Secret RDP_PASS]"
+            Write-Output " [+] RDP Tunnel Ready : $tunnelUrl"
+            Write-Output " [+] Username         : mikey"
+            Write-Output " [+] Fallback User    : runneradmin"
             Write-Output "============================================"
             echo "tunnel_url=$tunnelUrl" >> $env:GITHUB_OUTPUT
             echo "TUNNEL_HOST=$tunnelUrl" >> $env:GITHUB_ENV
             echo "TUNNEL_TYPE=$tunnelType" >> $env:GITHUB_ENV
+
+            @(
+              "### 🖥️ Windows 11 RDP Connection Ready",
+              "- **Host / IP**: \`$tunnelUrl\`",
+              "- **Username**: \`mikey\` (أو \`runneradmin\`)",
+              "- **Password**: \`$env:RDP_PASSWORD\`",
+              "- **OS**: Windows 11 (Windows Server 2025)"
+            ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           } else {
             Write-Output "[!] Failed to get tunnel URL"
             if (Test-Path "C:\logs\bore.log") { Get-Content "C:\logs\bore.log" }
@@ -270,7 +294,7 @@ jobs:
             exit 1
           }
 
-                # ── 6. Build .rdp Artifact (bug fixed — no duplicate $url) ───────────
+      # ── 6. Build .rdp Artifact & Credentials ─────────────────────────────
       - name: Build and Upload .rdp Artifact
         shell: pwsh
         run: |
@@ -279,38 +303,41 @@ jobs:
             "username:s:mikey",
             "prompt for credentials:i:1",
             "administrative session:i:1",
-            "authentication level:i:0",
-            "enablecredsspsupport:i:0",
             "autoreconnection enabled:i:1",
             "smart sizing:i:1",
             "screen mode id:i:2",
             "desktopwidth:i:1366",
             "desktopheight:i:768",
-            "session bpp:i:16",
+            "session bpp:i:24",
             "compression:i:1",
             "bitmapcachepersistenable:i:1",
             "connection type:i:2",
-            "networkautodetect:i:0",
+            "networkautodetect:i:1",
             "bandwidthautodetect:i:1",
-            "disable wallpaper:i:1",
-            "allow font smoothing:i:1",
-            "allow desktop composition:i:0",
-            "disable full window drag:i:1",
-            "disable menu anims:i:1",
-            "disable themes:i:0",
             "audiomode:i:2",
             "redirectprinters:i:0",
             "redirectcomports:i:0",
             "redirectsmartcards:i:0",
             "redirectclipboard:i:1"
           ) | Out-File -FilePath rdp-connection.rdp -Encoding ascii
-          Write-Output "[+] .rdp file ready"
+
+          @(
+            "=== Windows 11 RDP Credentials ===",
+            "Host: ${{ env.TUNNEL_HOST }}",
+            "Username: mikey",
+            "Alternative User: runneradmin",
+            "Password: ${{ env.RDP_PASSWORD }}",
+            "OS: Windows 11 (Windows Server 2025)"
+          ) | Out-File -FilePath credentials.txt -Encoding utf8
+          Write-Output "[+] .rdp and credentials.txt ready"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: rdp-connection
-          path: rdp-connection.rdp
+          path: |
+            rdp-connection.rdp
+            credentials.txt
           retention-days: 1
 
       # ── 7. OpenCode AI + REA ──────────────────────────────────────────────
