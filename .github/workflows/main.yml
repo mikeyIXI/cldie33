@@ -60,7 +60,7 @@ on:
       auto_restart:
         description: 'Auto-restart new session when this one ends (infinite chain)'
         required: false
-        default: 'true'
+        default: 'false'
 
 # ─── WINDOWS RDP JOB ─────────────────────────────────────────────────────────
 concurrency:
@@ -757,30 +757,6 @@ jobs:
           # Final delta save
           if ($env:CHAIN_ID) {
             try { powershell -NoProfile -ExecutionPolicy Bypass -File "C:\sync_delta_apps.ps1" -ChainId $env:CHAIN_ID } catch {}
-          }
-          # Fallback trigger if keep-alive exited abnormally without auto-triggering
-          if ($env:AUTO_RESTART -eq "true" -and "${{ job.status }}" -ne "cancelled") {
-            $body = @{
-              ref    = $env:GH_REF
-              inputs = @{
-                windows_version = $env:WIN_VERSION
-                ram_size        = $env:RAM_SIZE
-                ngrok_token     = $env:NGROK_TOKEN
-                ngrok_region    = $env:NGROK_REGION
-                chain_id        = $env:CHAIN_ID
-                auto_restart    = "true"
-              }
-            } | ConvertTo-Json -Depth 3
-            $headers = @{
-              "Authorization" = "token $env:GH_TOKEN"
-              "Accept"        = "application/vnd.github.v3+json"
-              "Content-Type"  = "application/json"
-            }
-            try {
-              Invoke-RestMethod "https://api.github.com/repos/$env:GH_REPO/actions/workflows/main.yml/dispatches" `
-                -Method Post -Headers $headers -Body $body -ErrorAction SilentlyContinue | Out-Null
-              Write-Output "[+] Fallback: next session triggered from cleanup."
-            } catch {}
           }
           try { Stop-Process -Name "bore" -Force -ErrorAction SilentlyContinue } catch {}
           $global:LASTEXITCODE = 0
