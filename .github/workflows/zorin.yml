@@ -59,8 +59,11 @@ jobs:
             xfce4-goodies \
             xfce4-terminal \
             xfce4-whiskermenu-plugin \
+            xfce4-pulseaudio-plugin \
+            pavucontrol \
             dbus-x11 \
             x11-xserver-utils \
+            fonts-ubuntu \
             firefox \
             curl \
             wget \
@@ -76,7 +79,7 @@ jobs:
           sudo chmod +x /usr/local/bin/bore
 
           # Install official Zorin OS Desktop & Icon themes
-          echo "[*] Downloading official Zorin OS themes..."
+          echo "[*] Downloading official Zorin OS themes & icons..."
           git clone --depth 1 https://github.com/ZorinOS/zorin-desktop-themes.git /tmp/zorin-themes || true
           if [ -d "/tmp/zorin-themes" ]; then
             sudo cp -r /tmp/zorin-themes/ZorinBlue-Dark* /usr/share/themes/ || true
@@ -85,10 +88,27 @@ jobs:
 
           git clone --depth 1 https://github.com/ZorinOS/zorin-icon-themes.git /tmp/zorin-icons || true
           if [ -d "/tmp/zorin-icons" ]; then
-            sudo cp -r /tmp/zorin-icons/ZorinBlue-Dark* /usr/share/icons/ || true
-            sudo cp -r /tmp/zorin-icons/ZorinBlue-Light* /usr/share/icons/ || true
-            gtk-update-icon-cache /usr/share/icons/ZorinBlue-Dark || true
+            sudo cp -r /tmp/zorin-icons/Zorin* /usr/share/icons/ || true
+            sudo gtk-update-icon-cache /usr/share/icons/Zorin || true
+            sudo gtk-update-icon-cache /usr/share/icons/ZorinBlue-Dark || true
+            
+            # Extract Zorin logo for Whisker Menu button
+            sudo mkdir -p /usr/share/pixmaps
+            if [ -f "/tmp/zorin-icons/Zorin/48x48/places/start-here.png" ]; then
+              sudo cp /tmp/zorin-icons/Zorin/48x48/places/start-here.png /usr/share/pixmaps/zorin-menu.png
+              sudo cp /tmp/zorin-icons/Zorin/48x48/places/start-here.png /usr/share/pixmaps/zorin-logo.png
+            fi
           fi
+
+          # Download official Zorin OS Mountain Wallpapers
+          echo "[*] Downloading official Zorin OS wallpapers..."
+          sudo mkdir -p /usr/share/backgrounds/zorin /usr/share/backgrounds/xfce
+          sudo curl -sL "https://raw.githubusercontent.com/saint-13/Linux_Dynamic_Wallpapers/main/Dynamic_Wallpapers/ZorinMountain/Night.jpg" -o /usr/share/backgrounds/zorin/zorin-mountain.jpg
+          sudo curl -sL "https://raw.githubusercontent.com/saint-13/Linux_Dynamic_Wallpapers/main/Dynamic_Wallpapers/ZorinMountain/Day.jpg" -o /usr/share/backgrounds/zorin/zorin-mountain-day.jpg
+          # Overwrite default XFCE wallpapers so any default/fallback screen shows Zorin OS wallpaper
+          sudo cp /usr/share/backgrounds/zorin/zorin-mountain.jpg /usr/share/backgrounds/xfce/xfce-teal.jpg || true
+          sudo cp /usr/share/backgrounds/zorin/zorin-mountain.jpg /usr/share/backgrounds/xfce/xfce-blue.jpg || true
+          sudo cp /usr/share/backgrounds/zorin/zorin-mountain.jpg /usr/share/backgrounds/xfce/xfce-stripes.png || true
 
           # Setup users: 'mikey' and 'runner'
           echo "[*] Setting up users..."
@@ -125,10 +145,21 @@ jobs:
           ResultActive=yes
           EOF
 
-          # Configure ~/.xsession
+          # Configure ~/.xsession with dynamic wallpaper setter
           for u in mikey runner; do
             UHOME="/home/$u"
-            echo "xfce4-session" | sudo tee "$UHOME/.xsession"
+            cat << 'XSES' | sudo tee "$UHOME/.xsession"
+          #!/bin/bash
+          # Dynamic wallpaper setter on session start
+          (
+            sleep 2
+            for prop in $(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep -E "last-image|image-path"); do
+              xfconf-query -c xfce4-desktop -p "$prop" -s /usr/share/backgrounds/zorin/zorin-mountain.jpg 2>/dev/null || true
+            done
+            xfdesktop --reload 2>/dev/null || true
+          ) &
+          exec xfce4-session
+          XSES
             sudo chmod 755 "$UHOME"
             sudo chmod +x "$UHOME/.xsession"
             sudo chown -R $u:$u "$UHOME"
@@ -176,11 +207,164 @@ jobs:
           sudo sed -i 's/max_bpp=32/max_bpp=24/g' /etc/xrdp/xrdp.ini
           sudo sed -i 's/crypt_level=high/crypt_level=low/g' /etc/xrdp/xrdp.ini
 
-          # Configure XFCE Zorin Theme for mikey and runner
-          for u in mikey runner; do
-            UHOME="/home/$u"
-            sudo mkdir -p "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml"
-            sudo tee "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" << 'XSET'
+          # Create Zorin OS Panel and Desktop configurations
+          sudo mkdir -p /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml
+          sudo mkdir -p /etc/skel/.config/xfce4/panel
+          sudo mkdir -p /etc/xdg/xfce4/xfconf/xfce-perchannel-xml
+
+          cat << 'PANELXML' | sudo tee /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-panel" version="1.0">
+            <property name="configver" type="int" value="2"/>
+            <property name="panels" type="array">
+              <value type="int" value="1"/>
+              <property name="panel-1" type="empty">
+                <property name="position" type="string" value="p=8;x=0;y=0"/>
+                <property name="length" type="uint" value="100"/>
+                <property name="position-locked" type="bool" value="true"/>
+                <property name="size" type="uint" value="40"/>
+                <property name="plugin-ids" type="array">
+                  <value type="int" value="1"/>
+                  <value type="int" value="2"/>
+                  <value type="int" value="3"/>
+                  <value type="int" value="4"/>
+                  <value type="int" value="5"/>
+                  <value type="int" value="6"/>
+                  <value type="int" value="7"/>
+                </property>
+                <property name="background-style" type="uint" value="0"/>
+                <property name="length-adjust" type="bool" value="true"/>
+                <property name="span-monitors" type="bool" value="false"/>
+                <property name="mode" type="uint" value="0"/>
+                <property name="autohide-behavior" type="uint" value="0"/>
+                <property name="disable-struts" type="bool" value="false"/>
+              </property>
+            </property>
+            <property name="plugins" type="empty">
+              <property name="plugin-1" type="string" value="whiskermenu">
+                <property name="button-icon" type="string" value="/usr/share/pixmaps/zorin-menu.png"/>
+                <property name="show-button-title" type="bool" value="false"/>
+                <property name="show-button-icon" type="bool" value="true"/>
+              </property>
+              <property name="plugin-2" type="string" value="tasklist">
+                <property name="flat-buttons" type="bool" value="true"/>
+                <property name="show-labels" type="bool" value="true"/>
+                <property name="grouping" type="uint" value="1"/>
+                <property name="show-handle" type="bool" value="false"/>
+                <property name="sort-order" type="uint" value="0"/>
+              </property>
+              <property name="plugin-3" type="string" value="separator">
+                <property name="style" type="uint" value="0"/>
+                <property name="expand" type="bool" value="true"/>
+              </property>
+              <property name="plugin-4" type="string" value="systray">
+                <property name="show-frame" type="bool" value="false"/>
+                <property name="size-max" type="uint" value="24"/>
+                <property name="square-icons" type="bool" value="true"/>
+              </property>
+              <property name="plugin-5" type="string" value="pulseaudio">
+                <property name="enable-keyboard-shortcuts" type="bool" value="true"/>
+              </property>
+              <property name="plugin-6" type="string" value="clock">
+                <property name="digital-layout" type="uint" value="3"/>
+                <property name="digital-time-format" type="string" value="%l:%M %p"/>
+                <property name="mode" type="uint" value="2"/>
+              </property>
+              <property name="plugin-7" type="string" value="showdesktop"/>
+            </property>
+          </channel>
+          PANELXML
+
+          cat << 'WHISKER' | sudo tee /etc/skel/.config/xfce4/panel/whiskermenu-1.rc
+          favorites=firefox.desktop,xfce4-terminal.desktop,thunar.desktop
+          recent=
+          button-title=Start
+          button-icon=/usr/share/pixmaps/zorin-menu.png
+          button-single-row=false
+          show-button-title=false
+          show-button-icon=true
+          launcher-show-name=true
+          launcher-show-description=true
+          launcher-show-tooltip=true
+          item-icon-size=2
+          hover-switch-category=false
+          category-icon-size=1
+          load-hierarchy=false
+          recent-items-max=10
+          favorites-in-recent=true
+          display-recent-default=false
+          position-search-alternate=false
+          position-commands-alternate=false
+          position-categories-alternate=false
+          menu-width=430
+          menu-height=560
+          menu-opacity=95
+          command-settings=xfce4-settings-manager
+          show-command-settings=true
+          command-lockscreen=xflock4
+          show-command-lockscreen=true
+          command-switchuser=gdmflexiserver
+          show-command-switchuser=true
+          command-logout=xfce4-session-logout
+          show-command-logout=true
+          WHISKER
+
+          cat << 'DESKXML' | sudo tee /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-desktop" version="1.0">
+            <property name="backdrop" type="empty">
+              <property name="screen0" type="empty">
+                <property name="monitor0" type="empty">
+                  <property name="image-path" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="5"/>
+                    <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  </property>
+                </property>
+                <property name="monitorVirtual1" type="empty">
+                  <property name="image-path" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="5"/>
+                    <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  </property>
+                </property>
+                <property name="monitorVNC-0" type="empty">
+                  <property name="image-path" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="5"/>
+                    <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  </property>
+                </property>
+                <property name="monitorscreen" type="empty">
+                  <property name="image-path" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="5"/>
+                    <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  </property>
+                </property>
+                <property name="monitorrdp0" type="empty">
+                  <property name="image-path" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="5"/>
+                    <property name="last-image" type="string" value="/usr/share/backgrounds/zorin/zorin-mountain.jpg"/>
+                  </property>
+                </property>
+              </property>
+            </property>
+          </channel>
+          DESKXML
+
+          cat << 'XSET' | sudo tee /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
           <?xml version="1.0" encoding="UTF-8"?>
           <channel name="xsettings" version="1.0">
             <property name="Net" type="empty">
@@ -191,7 +375,7 @@ jobs:
               <property name="EnableInputFeedbackSounds" type="bool" value="false"/>
             </property>
             <property name="Gtk" type="empty">
-              <property name="FontName" type="string" value="Sans 10"/>
+              <property name="FontName" type="string" value="Ubuntu 10"/>
               <property name="MonospaceFontName" type="string" value="Monospace 10"/>
               <property name="CursorThemeName" type="string" value="DMZ-White"/>
               <property name="CursorThemeSize" type="int" value="24"/>
@@ -200,16 +384,30 @@ jobs:
           </channel>
           XSET
 
-            sudo tee "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" << 'XFWM'
+          cat << 'XFWM' | sudo tee /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
           <?xml version="1.0" encoding="UTF-8"?>
           <channel name="xfwm4" version="1.0">
             <property name="general" type="empty">
               <property name="theme" type="string" value="ZorinBlue-Dark"/>
-              <property name="title_font" type="string" value="Sans Bold 9"/>
+              <property name="title_font" type="string" value="Ubuntu Bold 10"/>
               <property name="button_layout" type="string" value="O|HMC"/>
+              <property name="box_move" type="bool" value="false"/>
+              <property name="box_resize" type="bool" value="false"/>
+              <property name="use_compositing" type="bool" value="false"/>
             </property>
           </channel>
           XFWM
+
+          # Copy system-wide defaults to /etc/xdg
+          sudo cp -r /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/* /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ 2>/dev/null || true
+
+          # Apply configs to both 'mikey' and 'runner'
+          for u in mikey runner; do
+            UHOME="/home/$u"
+            sudo mkdir -p "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml"
+            sudo mkdir -p "$UHOME/.config/xfce4/panel"
+            sudo cp -r /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/* "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml/"
+            sudo cp /etc/skel/.config/xfce4/panel/whiskermenu-1.rc "$UHOME/.config/xfce4/panel/"
 
             # Create desktop shortcuts for Firefox & Terminal
             sudo mkdir -p "$UHOME/Desktop"
