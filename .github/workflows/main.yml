@@ -280,13 +280,12 @@ jobs:
             echo "TUNNEL_HOST=$tunnelUrl" >> $env:GITHUB_ENV
             echo "TUNNEL_TYPE=$tunnelType" >> $env:GITHUB_ENV
 
-            @(
-              "### 🖥️ Windows 11 RDP Connection Ready",
-              "- **Host / IP**: \`$tunnelUrl\`",
-              "- **Username**: \`mikey\` (أو \`runneradmin\`)",
-              "- **Password**: \`$env:RDP_PASSWORD\`",
-              "- **OS**: Windows 11 (Windows Server 2025)"
-            ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            "### Windows 11 RDP Connection Ready" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            "- Host / IP: $tunnelUrl" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            "- Username: mikey" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            "- Alternative User: runneradmin" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            "- Password: $env:RDP_PASSWORD" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            "- OS: Windows 11 (Windows Server 2025)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           } else {
             Write-Output "[!] Failed to get tunnel URL"
             if (Test-Path "C:\logs\bore.log") { Get-Content "C:\logs\bore.log" }
