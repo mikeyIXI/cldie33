@@ -44,7 +44,7 @@ jobs:
           rm -f bore.tar.gz
           echo "[+] Bore installed for $ARCH"
 
-      # ── 2. Configure Password & System ────────────────────────────────────
+      # ── 2. Configure Password, TCC & System ───────────────────────────────
       - name: Configure User and Remote Access
         env:
           RDP_SECRET_PASS: ${{ secrets.RDP_PASS }}
@@ -56,37 +56,106 @@ jobs:
           echo "::add-mask::$PASS"
           echo "MAC_PASS=$PASS" >> $GITHUB_ENV
 
-          # 1. Create dedicated user 'mikey'
-          sudo dscl . -create /Users/mikey
-          sudo dscl . -create /Users/mikey UserShell /bin/zsh
-          sudo dscl . -create /Users/mikey RealName "Mikey"
-          sudo dscl . -create /Users/mikey UniqueID 1001
-          sudo dscl . -create /Users/mikey PrimaryGroupID 80
-          sudo dscl . -create /Users/mikey NFSHomeDirectory /Users/mikey
+          # 1. Prevent display & system sleep and keep display awake
+          sudo pmset -a displaysleep 0 sleep 0 disksleep 0 2>/dev/null || true
+          sudo pmset -a disablesleep 1 2>/dev/null || true
+          defaults -currentHost write com.apple.screensaver idleTime 0 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser "runner" 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false 2>/dev/null || true
+          nohup caffeinate -dimsu &
+
+          # 2. Try to decode runner user password from /etc/kcpassword
+          RUNNER_PASS=$(python3 -c '
+          key = [125, 137, 82, 35, 210, 188, 221, 234, 163, 185, 31]
+          try:
+              with open("/etc/kcpassword", "rb") as f:
+                  data = f.read()
+              pw = []
+              for i, b in enumerate(data):
+                  c = b ^ key[i % len(key)]
+                  if c == 0: break
+                  pw.append(chr(c))
+              print("".join(pw))
+          except Exception:
+              print("")
+          ' 2>/dev/null || true)
+          if [ -n "$RUNNER_PASS" ]; then
+            echo "::add-mask::$RUNNER_PASS"
+            echo "RUNNER_PASS=$RUNNER_PASS" >> $GITHUB_ENV
+            echo "[+] runner password extracted successfully"
+          else
+            echo "RUNNER_PASS=" >> $GITHUB_ENV
+          fi
+
+          # 3. Create dedicated user 'mikey'
+          sudo dscl . -create /Users/mikey 2>/dev/null || true
+          sudo dscl . -create /Users/mikey UserShell /bin/zsh 2>/dev/null || true
+          sudo dscl . -create /Users/mikey RealName "Mikey" 2>/dev/null || true
+          sudo dscl . -create /Users/mikey UniqueID 1001 2>/dev/null || true
+          sudo dscl . -create /Users/mikey PrimaryGroupID 80 2>/dev/null || true
+          sudo dscl . -create /Users/mikey NFSHomeDirectory /Users/mikey 2>/dev/null || true
           sudo cp -R "/System/Library/User Template/English.lproj" /Users/mikey 2>/dev/null || sudo mkdir -p /Users/mikey
           sudo chown -R mikey:admin /Users/mikey 2>/dev/null || true
-          sudo dscl . -passwd /Users/mikey "$PASS"
+          sudo dscl . -passwd /Users/mikey "$PASS" 2>/dev/null || true
 
-          # 2. Add mikey to admin & remote access groups
-          sudo dseditgroup -o edit -a mikey -t user admin 2>/dev/null || true
-          sudo dseditgroup -o edit -a mikey -t user com.apple.access_screensharing 2>/dev/null || true
-          sudo dseditgroup -o edit -a mikey -t user com.apple.access_ssh 2>/dev/null || true
+          # 4. Add users to admin & remote access groups
+          for u in runner mikey; do
+            sudo dseditgroup -o edit -a "$u" -t user admin 2>/dev/null || true
+            sudo dseditgroup -o edit -a "$u" -t user com.apple.access_screensharing 2>/dev/null || true
+            sudo dseditgroup -o edit -a "$u" -t user com.apple.access_ssh 2>/dev/null || true
+          done
 
-          # 3. Enable Remote Management & Screen Sharing with kickstart
+          # 5. Set Legacy VNC password hash in /Library/Preferences/com.apple.VNCSettings.txt
+          echo "$PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
+          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
+
+          # 6. Inject TCC permissions (Screen Recording, PostEvent, Accessibility) into System & User TCC.db
+          # Resolves black screen on macOS Sonoma & Sequoia
+          CLIENTS=(
+            "com.apple.screensharing.agent"
+            "com.apple.RemoteDesktopAgent"
+            "com.apple.screensharingd"
+            "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent"
+            "/System/Library/CoreServices/RemoteManagement/ScreensharingAgent.bundle/Contents/MacOS/ScreensharingAgent"
+          )
+          for client in "${CLIENTS[@]}"; do
+            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+              "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+              "INSERT OR REPLACE INTO access VALUES('kTCCServicePostEvent','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+              "INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+          done
+
+          for udir in /Users/runner /Users/mikey; do
+            sudo mkdir -p "$udir/Library/Application Support/com.apple.TCC"
+            for client in "com.apple.screensharing.agent" "com.apple.RemoteDesktopAgent" "com.apple.screensharingd"; do
+              sudo sqlite3 "$udir/Library/Application Support/com.apple.TCC/TCC.db" \
+                "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+              sudo sqlite3 "$udir/Library/Application Support/com.apple.TCC/TCC.db" \
+                "INSERT OR REPLACE INTO access VALUES('kTCCServicePostEvent','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+              sudo sqlite3 "$udir/Library/Application Support/com.apple.TCC/TCC.db" \
+                "INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','$client',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null || true
+            done
+            sudo chown -R "$(basename "$udir")" "$udir/Library/Application Support/com.apple.TCC" 2>/dev/null || true
+          done
+
+          # 7. Configure and restart ARDAgent / Screen Sharing
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
-            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PASS" \
-            -users mikey \
+            -clientopts -setvnclegacy -vnclegacy yes \
             -privs -all \
             -allowAccessFor -allUsers \
             -restart -agent -console
 
-          # 4. Enable auto-login for mikey so desktop session is active
-          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser "mikey" 2>/dev/null || true
+          # 8. Wake display and WindowServer
+          caffeinate -u -t 5 2>/dev/null || true
+          osascript -e 'tell application "System Events" to key code 123' 2>/dev/null || true
 
-          # 5. Enable SSH
+          # 9. Enable SSH
           sudo systemsetup -setremotelogin on 2>/dev/null || true
-          echo "[+] User 'mikey' created and Screen Sharing configured"
+          echo "[+] System configured, TCC injected, and Screen Sharing service restarted"
 
       # ── 3. Start Tunnel ────────────────────────────────────────────────────
       - name: Start Bore Tunnel
@@ -109,18 +178,25 @@ jobs:
             echo "::add-mask::$TUNNEL_URL"
             echo "============================================"
             echo " [+] macOS VNC Ready : $TUNNEL_URL"
-            echo " [+] Username        : mikey"
             echo " [+] Password        : $MAC_PASS"
+            echo " [+] Username        : mikey"
+            if [ -n "$RUNNER_PASS" ]; then
+              echo " [+] Runner User Pass: $RUNNER_PASS"
+            fi
             echo "============================================"
 
             echo "### 🍎 macOS Screen Sharing (VNC) Ready" >> $GITHUB_STEP_SUMMARY
             echo "- **VNC Address**: \`$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Username**: \`mikey\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Password**: \`$MAC_PASS\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Username (if requested)**: \`mikey\`" >> $GITHUB_STEP_SUMMARY
+            if [ -n "$RUNNER_PASS" ]; then
+              echo "- **Runner Console User**: \`runner\` (Password: \`$RUNNER_PASS\`)" >> $GITHUB_STEP_SUMMARY
+            fi
             echo "- **How to connect**:" >> $GITHUB_STEP_SUMMARY
-            echo "  - **From Windows**: Use RealVNC Viewer, TightVNC, or TigerVNC (Address: \`$TUNNEL_URL\`, Username: \`mikey\`, Password: \`$MAC_PASS\`)" >> $GITHUB_STEP_SUMMARY
+            echo "  - **Method 1 (Standard VNC - Recommended)**: In RealVNC Viewer, enter \`$TUNNEL_URL\`. When prompted for password, enter \`$MAC_PASS\` (leave Username empty or as default)." >> $GITHUB_STEP_SUMMARY
+            echo "  - **Method 2 (Apple Remote Desktop)**: Enter Username: \`mikey\` and Password: \`$MAC_PASS\`." >> $GITHUB_STEP_SUMMARY
             echo "  - **From Mac**: Press \`Cmd + K\` in Finder or Safari and type \`vnc://$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
-            echo "  - **From iPhone/Android**: Download **VNC Viewer** app from App Store / Google Play" >> $GITHUB_STEP_SUMMARY
+            echo "  - **From Mobile**: Download **VNC Viewer** app and connect to \`$TUNNEL_URL\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "[!] Failed to get bore tunnel"
             cat /tmp/logs/bore.log 2>/dev/null || true
@@ -133,14 +209,15 @@ jobs:
           cat << EOF > macos-vnc-info.txt
           === macOS Remote Desktop (Screen Sharing / VNC) ===
           VNC Address: ${{ env.TUNNEL_HOST }}
-          Username: mikey
           Password: ${{ env.MAC_PASS }}
+          Username: mikey
+          Runner User: runner
           Connection URL: vnc://${{ env.TUNNEL_HOST }}
 
           How to connect:
-          - Windows: RealVNC, TightVNC, TigerVNC (Username: mikey, Password: ${{ env.MAC_PASS }})
-          - macOS: Finder -> Go -> Connect to Server (Cmd+K) -> vnc://${{ env.TUNNEL_HOST }}
-          - Mobile: VNC Viewer app
+          - Method 1: RealVNC Viewer -> ${{ env.TUNNEL_HOST }} -> Password: ${{ env.MAC_PASS }}
+          - Method 2: RealVNC Viewer -> Username: mikey, Password: ${{ env.MAC_PASS }}
+          - macOS Finder: Cmd+K -> vnc://${{ env.TUNNEL_HOST }}
           EOF
 
       - name: Upload Artifact
