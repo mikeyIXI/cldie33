@@ -117,6 +117,44 @@ jobs:
           done
           sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || { echo "::error::Screen Sharing not listening on 5900"; exit 1; }
 
+      - name: Performance Tuning (no animations, cursor, low CPU)
+        run: |
+          # The runner has no GPU, so every animation/blur is software-rendered and shows as lag
+          # over VNC. Turn them off for both the console user and mikey.
+          for U in "$CONSOLE_USER" mikey; do
+            id "$U" >/dev/null 2>&1 || continue
+            D="sudo -u $U defaults"
+            $D write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
+            $D write NSGlobalDomain NSWindowResizeTime -float 0.001
+            $D write NSGlobalDomain NSScrollAnimationEnabled -bool false
+            $D write NSGlobalDomain NSDocumentRevisionsWindowTransformAnimation -bool false
+            $D write NSGlobalDomain NSToolbarFullScreenAnimationDuration -float 0
+            $D write NSGlobalDomain QLPanelAnimationDuration -float 0
+            $D write NSGlobalDomain NSBrowserColumnAnimationSpeedMultiplier -float 0
+            $D write NSGlobalDomain com.apple.springing.delay -float 0
+            $D write com.apple.universalaccess reduceMotion -bool true
+            $D write com.apple.universalaccess reduceTransparency -bool true
+            $D write com.apple.dock launchanim -bool false
+            $D write com.apple.dock mineffect -string scale
+            $D write com.apple.dock expose-animation-duration -float 0
+            $D write com.apple.dock springboard-show-duration -float 0
+            $D write com.apple.dock springboard-hide-duration -float 0
+            $D write com.apple.dock autohide-time-modifier -float 0
+            $D write com.apple.dock autohide-delay -float 0
+            $D write com.apple.finder DisableAllAnimations -bool true
+            $D write com.apple.Accessibility ReduceMotionEnabled -int 1
+          done
+          sudo killall Dock Finder 2>/dev/null || true
+          # Background CPU hogs on a 3-core VM
+          sudo mdutil -a -i off 2>/dev/null || true
+          sudo launchctl bootout system/com.apple.metadata.mds 2>/dev/null || true
+          for A in com.apple.photoanalysisd com.apple.mediaanalysisd com.apple.suggestd com.apple.knowledge-agent com.apple.biomesyncd; do
+            sudo launchctl bootout gui/$(id -u "$CONSOLE_USER")/$A 2>/dev/null || true
+          done
+          sudo pkill -x photoanalysisd 2>/dev/null || true
+          sudo pkill -x mediaanalysisd 2>/dev/null || true
+          sudo pkill -x softwareupdated 2>/dev/null || true
+
       - name: Verify Real Desktop Frame Through VNC
         run: |
           mkdir -p connection-details
@@ -167,7 +205,7 @@ jobs:
           # Genuine Apple macOS Remote Desktop
 
           ## 1. Browser (HTTPS, one click)
-          ${CF_URL}/vnc.html?autoconnect=true&resize=scale
+          ${CF_URL}/vnc.html?autoconnect=true&resize=scale&show_dot=true&quality=5&compression=3
 
           ## 2. RealVNC Viewer / TigerVNC
           Address : bore.pub:${VNC_PORT}
