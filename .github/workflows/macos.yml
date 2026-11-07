@@ -159,47 +159,74 @@ jobs:
         run: |
           mkdir -p connection-details
           exec > >(tee -a connection-details/diag.log) 2>&1
-          dscl . -authonly "$CONSOLE_USER" "$MAC_PASSWORD" && echo "Console password OK" || echo "Console password NOT accepted"
-          dscl . -read /Users/$CONSOLE_USER RealName 2>/dev/null || true
-          sleep 5
+          sleep 2
           python3 -m venv /tmp/vncvenv
           /tmp/vncvenv/bin/pip install -q pycryptodome pillow websockify
-          V="perl -e alarm(150);exec(@ARGV) /tmp/vncvenv/bin/python vnc_check.py"
           screencapture -x connection-details/1_local_screen.png || true
-          echo "== A: VNC password viewer (RealVNC / noVNC) =="
-          $V vnc "$MAC_PASSWORD" connection-details/2_vnc_password.png || true
-          echo "== B: Apple ARD viewer as admin mikey =="
-          $V ard mikey "$MAC_PASSWORD" connection-details/3_ard_mikey.png || true
-          echo "== C: VNC password viewer + typing account password at lock screen =="
-          $V vnc "$MAC_PASSWORD" connection-details/4_vnc_before_unlock.png "$MAC_PASSWORD" connection-details/5_vnc_after_unlock.png || true
-          sleep 3
-          screencapture -x connection-details/6_local_after.png || true
+          echo "== Quick VNC Frame Verification =="
+          perl -e 'alarm(35);exec(@ARGV)' /tmp/vncvenv/bin/python vnc_check.py vnc "$MAC_PASSWORD" connection-details/2_vnc_password.png || true
 
-      - name: Install & Start RustDesk (fast H.264/VP9 remote, no account)
+      - name: Install & Start RustDesk (fast H.264/VP9 remote, full mouse/keyboard)
         run: |
           mkdir -p connection-details
+          exec > >(tee -a connection-details/diag.log) 2>&1
           if [ "$(uname -m)" = "arm64" ]; then A=aarch64; else A=x86_64; fi
           for i in 1 2 3 4 5; do curl -fsSL -o /tmp/rd.dmg "https://github.com/rustdesk/rustdesk/releases/download/1.5.1/rustdesk-1.5.1-${A}.dmg" && break; sleep 10; done
           hdiutil attach -nobrowse -quiet /tmp/rd.dmg -mountpoint /tmp/rdmnt
           sudo cp -R /tmp/rdmnt/RustDesk.app /Applications/
           hdiutil detach -quiet /tmp/rdmnt || true
           sudo xattr -dr com.apple.quarantine /Applications/RustDesk.app || true
+          sudo chown -R root:wheel /Applications/RustDesk.app || true
           BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /Applications/RustDesk.app/Contents/Info.plist)
-          echo "Bundle id: $BID"
+          UIDN=$(id -u "$CONSOLE_USER")
+          echo "Bundle id: $BID | Console UID: $UIDN ($CONSOLE_USER)"
 
-          # Screen Recording / Accessibility / input grants (same fix as Screen Sharing)
+          # Extract real code-signing requirement blob (csreq) for signed bundle TCC matching
+          REQ=$(codesign -dr - /Applications/RustDesk.app 2>&1 | awk -F ' => ' '/=>/{print $2}')
+          if [ -n "$REQ" ] && csreq -r "$REQ" -b /tmp/rd.csreq 2>/dev/null; then
+            CSHEX="X'$(xxd -p /tmp/rd.csreq | tr -d '\n')'"
+          else
+            CSHEX="NULL"
+          fi
+          echo "CSREQ blob length: ${#CSHEX}"
+
+          # Grant ScreenCapture, Accessibility, PostEvent & ListenEvent to RustDesk bundles,
+          # binaries, AND runner responsible processes so CGEventPost mouse/key events are never dropped
           COLS="service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified"
+          NOW=$(date +%s)
           for DB in "/Library/Application Support/com.apple.TCC/TCC.db" "/Users/$CONSOLE_USER/Library/Application Support/com.apple.TCC/TCC.db"; do
             [ -f "$DB" ] || continue
-            for C in "$BID|0" "/Applications/RustDesk.app/Contents/MacOS/RustDesk|1" "/Applications/RustDesk.app/Contents/MacOS/service|1"; do
+            for BUNDLE in "$BID" "com.carriez.rustdesk" "com.carriez.RustDesk"; do
               for SVC in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent kTCCServiceMicrophone; do
-                sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access($COLS) VALUES('$SVC','${C%|*}',${C##*|},2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
+                sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access($COLS) VALUES('$SVC','$BUNDLE',0,2,4,1,$CSHEX,NULL,0,'UNUSED',NULL,0,$NOW);" 2>/dev/null || true
+              done
+            done
+            for BIN in \
+              "/Applications/RustDesk.app/Contents/MacOS/RustDesk" \
+              "/Applications/RustDesk.app/Contents/MacOS/service" \
+              "/opt/hca/hosted-compute-agent" \
+              "/usr/local/opt/runner/provisioner/provisioner" \
+              "/opt/off/opt/runner/provisioner/provisioner" \
+              "/bin/bash" \
+              "/usr/bin/osascript" \
+              "/usr/bin/python3"; do
+              for SVC in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent; do
+                sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access($COLS) VALUES('$SVC','$BIN',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$NOW);" 2>/dev/null || true
               done
             done
           done
-          sudo killall tccd 2>/dev/null || true
 
-          # Permanent password + Direct IP Access (port 21118, bypasses public server login!)
+          # Pre-approve macOS 15+ replayd screen capture prompt so no dialog steals focus
+          REPLAY_DIR="/Users/$CONSOLE_USER/Library/Group Containers/group.com.apple.replayd"
+          sudo -u "$CONSOLE_USER" mkdir -p "$REPLAY_DIR" || true
+          REPLAY_PLIST="$REPLAY_DIR/ScreenCaptureApprovals.plist"
+          for KEY in "$BID" "com.carriez.rustdesk" "/Applications/RustDesk.app/Contents/MacOS/RustDesk"; do
+            sudo -u "$CONSOLE_USER" defaults write "$REPLAY_PLIST" "$KEY" -date "3024-01-01 00:00:00 +0000" 2>/dev/null || true
+          done
+          sudo killall tccd cfprefsd 2>/dev/null || true
+          sleep 2
+
+          # Write full-control + Direct IP config for both console user and root (synced like install.scpt)
           for CFG in "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk" "/var/root/Library/Preferences/com.carriez.RustDesk"; do
             sudo mkdir -p "$CFG"
             printf "password = '%s'\n" "$MAC_PASSWORD" | sudo tee "$CFG/RustDesk.toml" >/dev/null
@@ -207,6 +234,11 @@ jobs:
           [options]
           direct-server = 'Y'
           direct-access-port = '21118'
+          access-mode = 'full'
+          enable-keyboard = 'Y'
+          enable-clipboard = 'Y'
+          enable-file-transfer = 'Y'
+          enable-tunnel = 'Y'
           verification-method = 'use-permanent-password'
           approve-mode = 'password'
           enable-hwcodec = 'Y'
@@ -214,30 +246,144 @@ jobs:
           enable-audio = 'N'
           show-remote-cursor = 'Y'
           TOML
-            sudo sed -i '' 's/^          //' "$CFG/RustDesk2.toml"
           done
           sudo chown -R "$CONSOLE_USER":staff "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk" || true
 
           # Disable macOS Application Firewall so incoming local/direct connections are never blocked
           sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off 2>/dev/null || true
 
-          UIDN=$(id -u "$CONSOLE_USER")
-          sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" open -a /Applications/RustDesk.app
-          sleep 10
-          # Ensure --server daemon is active so Direct IP listener binds TCP 21118
-          if ! sudo lsof -nP -iTCP:21118 -sTCP:LISTEN >/dev/null 2>&1; then
-            sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" nohup /Applications/RustDesk.app/Contents/MacOS/RustDesk --server >/tmp/rd_server.log 2>&1 &
-          fi
+          # Install official RustDesk LaunchDaemon + Aqua LaunchAgent (exact match to install.scpt)
+          # Running --server via Aqua LaunchAgent ensures launchd (not runner shell) is the responsible
+          # GUI process, enabling full Cocoa main-thread mouse & keyboard event posting.
+          sudo tee /Library/LaunchDaemons/com.carriez.RustDesk_service.plist >/dev/null <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>com.carriez.RustDesk_service</string>
+              <key>AssociatedBundleIdentifiers</key>
+              <string>${BID}</string>
+              <key>KeepAlive</key>
+              <true/>
+              <key>ThrottleInterval</key>
+              <integer>1</integer>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>/Applications/RustDesk.app/Contents/MacOS/service</string>
+              </array>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>WorkingDirectory</key>
+              <string>/Applications/RustDesk.app/Contents/MacOS/</string>
+              <key>StandardErrorPath</key>
+              <string>/var/log/rustdesk_service.err</string>
+              <key>StandardOutPath</key>
+              <string>/var/log/rustdesk_service.out</string>
+          </dict>
+          </plist>
+          PLIST
+          sudo chown root:wheel /Library/LaunchDaemons/com.carriez.RustDesk_service.plist
+          sudo chmod 644 /Library/LaunchDaemons/com.carriez.RustDesk_service.plist
+
+          sudo tee /Library/LaunchAgents/com.carriez.RustDesk_server.plist >/dev/null <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>com.carriez.RustDesk_server</string>
+              <key>AssociatedBundleIdentifiers</key>
+              <string>${BID}</string>
+              <key>LimitLoadToSessionType</key>
+              <array>
+                  <string>LoginWindow</string>
+                  <string>Aqua</string>
+              </array>
+              <key>KeepAlive</key>
+              <dict>
+                  <key>SuccessfulExit</key>
+                  <false/>
+                  <key>AfterInitialDemand</key>
+                  <false/>
+              </dict>
+              <key>ThrottleInterval</key>
+              <integer>1</integer>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>/Applications/RustDesk.app/Contents/MacOS/RustDesk</string>
+                  <string>--server</string>
+              </array>
+              <key>WorkingDirectory</key>
+              <string>/Applications/RustDesk.app/Contents/MacOS/</string>
+              <key>ProcessType</key>
+              <string>Interactive</string>
+              <key>StandardErrorPath</key>
+              <string>/tmp/rustdesk_server.err</string>
+              <key>StandardOutPath</key>
+              <string>/tmp/rustdesk_server.out</string>
+          </dict>
+          </plist>
+          PLIST
+          sudo chown root:wheel /Library/LaunchAgents/com.carriez.RustDesk_server.plist
+          sudo chmod 644 /Library/LaunchAgents/com.carriez.RustDesk_server.plist
+
+          sudo launchctl bootout system/com.carriez.RustDesk_service 2>/dev/null || true
+          sudo launchctl bootstrap system /Library/LaunchDaemons/com.carriez.RustDesk_service.plist 2>/dev/null || sudo launchctl load -w /Library/LaunchDaemons/com.carriez.RustDesk_service.plist || true
+
+          sudo launchctl bootout "gui/$UIDN/com.carriez.RustDesk_server" 2>/dev/null || true
+          sudo launchctl bootstrap "gui/$UIDN" /Library/LaunchAgents/com.carriez.RustDesk_server.plist 2>/dev/null || sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" launchctl load -w /Library/LaunchAgents/com.carriez.RustDesk_server.plist || true
+          sudo launchctl kickstart -k "gui/$UIDN/com.carriez.RustDesk_server" 2>/dev/null || true
+
           for i in $(seq 1 20); do
             sudo lsof -nP -iTCP:21118 -sTCP:LISTEN >/dev/null 2>&1 && break
             sleep 2
           done
-          echo "=== RustDesk Direct IP Port 21118 Listener ===" | tee -a connection-details/diag.log
-          sudo lsof -nP -iTCP:21118 -sTCP:LISTEN | tee -a connection-details/diag.log || true
 
+          # Set permanent password via CLI and sync config between user and root
+          sudo /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "$MAC_PASSWORD" 2>&1 | tail -2 || true
           sudo -u "$CONSOLE_USER" /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "$MAC_PASSWORD" 2>&1 | tail -2 || true
+          sudo cp -f "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk/RustDesk.toml" "/var/root/Library/Preferences/com.carriez.RustDesk/RustDesk.toml" 2>/dev/null || true
+          sudo chown -R "$CONSOLE_USER":staff "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk" || true
+
+          # Open RustDesk main window briefly to verify zero service/permission warnings in screenshot
+          sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" open -a /Applications/RustDesk.app || true
+          sleep 5
+
+          echo "=== RustDesk Direct IP Port 21118 Listener & LaunchAgent Status ==="
+          sudo lsof -nP -iTCP:21118 -sTCP:LISTEN || true
+          sudo launchctl print "gui/$UIDN/com.carriez.RustDesk_server" 2>&1 | head -n 25 || true
+
+          echo "=== Live macOS CGEvent Input Self-Test ==="
+          sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" /usr/bin/python3 - <<'PY' || true
+          import ctypes, time
+          cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+          app = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+          cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+          cg.CGPreflightPostEventAccess.restype = ctypes.c_bool
+          app.AXIsProcessTrusted.restype = ctypes.c_bool
+          class CGPoint(ctypes.Structure):
+              _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
+          cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+          cg.CGEventCreate.restype = ctypes.c_void_p
+          cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+          cg.CGEventGetLocation.restype = CGPoint
+          cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
+          cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+          cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+          p0 = cg.CGEventGetLocation(cg.CGEventCreate(None))
+          ev = cg.CGEventCreateMouseEvent(None, 5, CGPoint(420.0, 310.0), 0)
+          cg.CGEventPost(0, ev)
+          time.sleep(0.2)
+          p1 = cg.CGEventGetLocation(cg.CGEventCreate(None))
+          print(f"ScreenCapture={cg.CGPreflightScreenCaptureAccess()} PostEvent={cg.CGPreflightPostEventAccess()} AXTrusted={app.AXIsProcessTrusted()}")
+          print(f"Cursor before=({p0.x:.1f},{p0.y:.1f}) after=({p1.x:.1f},{p1.y:.1f})")
+          PY
+
           RD_ID=""
-          for i in $(seq 1 20); do
+          for i in $(seq 1 15); do
             RD_ID=$(sudo -u "$CONSOLE_USER" /Applications/RustDesk.app/Contents/MacOS/RustDesk --get-id 2>/dev/null | tr -dc '0-9' )
             [ -z "$RD_ID" ] && RD_ID=$(grep -E "^id *=" "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk/RustDesk.toml" 2>/dev/null | grep -oE "[0-9]{6,}" )
             [ -n "$RD_ID" ] && break
@@ -246,6 +392,8 @@ jobs:
           echo "RustDesk ID: $RD_ID"
           echo "RD_ID=$RD_ID" >> "$GITHUB_ENV"
           screencapture -x connection-details/7_rustdesk_running.png || true
+          # Close the RustDesk welcome window so the user lands on a clean desktop ready to use
+          osascript -e 'tell application "System Events" to tell process "RustDesk" to click button 1 of window 1' 2>/dev/null || true
 
       - name: Setup noVNC, Bore & Cloudflare
         run: |
@@ -295,7 +443,6 @@ jobs:
 
           Console user: ${CONSOLE_USER}  |  Extra admin user: mikey / ${MAC_PASSWORD}
           EOF
-          sed -i '' 's/^          //' connection-details/CREDENTIALS.md
           cat connection-details/CREDENTIALS.md
           cat connection-details/CREDENTIALS.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -312,11 +459,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AUTO_RESTART: ${{ inputs.auto_restart }}
         run: |
+          UIDN=$(id -u "$CONSOLE_USER")
           END=$(( $(date +%s) + 350 * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
             sudo pkill -u mikey -x "Setup Assistant" 2>/dev/null || true
-            pgrep -x RustDesk >/dev/null || sudo launchctl asuser $(id -u "$CONSOLE_USER") sudo -u "$CONSOLE_USER" open -a /Applications/RustDesk.app || true
             sudo pkill -u mikey -f "SetupAssistant" 2>/dev/null || true
+            if ! sudo lsof -nP -iTCP:21118 -sTCP:LISTEN >/dev/null 2>&1; then
+              echo "[!] RustDesk 21118 not listening, kickstarting Aqua LaunchAgent"
+              sudo launchctl kickstart -k "gui/$UIDN/com.carriez.RustDesk_server" 2>/dev/null || true
+            fi
             if ! pgrep -f "bore local 21118" > /dev/null; then
               echo "[!] bore 21118 died, restarting"
               nohup bore local 21118 --to bore.pub >> /tmp/bore_rd.log 2>&1 &
