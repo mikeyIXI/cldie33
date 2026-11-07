@@ -83,8 +83,13 @@ jobs:
 
       - name: Enable Apple Screen Sharing (VNC)
         run: |
+          dscl . -read /Users/$CONSOLE_USER RealName UniqueID 2>/dev/null || true
+          # macOS shows its lock screen to VNC-password viewers; give the console
+          # account a known password so it can be unlocked from the viewer.
+          sudo sysadminctl -resetPasswordFor "$CONSOLE_USER" -newPassword "$MAC_PASSWORD" 2>&1 | grep -v -- "----" || true
+          dscl . -authonly "$CONSOLE_USER" "$MAC_PASSWORD" && echo "Console user password set OK" || echo "::warning::console password check failed"
           # Extra admin account for clients that ask for username (ARD auth)
-          sudo sysadminctl -addUser mikey -fullName "Mikey" -password "$MAC_PASSWORD" -admin 2>&1 || true
+          sudo sysadminctl -addUser mikey -fullName "Mikey" -password "$MAC_PASSWORD" -admin 2>&1 | grep -v -- "----" || true
 
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -allowAccessFor -allUsers -privs -all \
@@ -97,9 +102,6 @@ jobs:
           done
           sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || { echo "::error::Screen Sharing not listening on 5900"; exit 1; }
 
-          # Security types: 2 = VNC password, 30 = Apple ARD
-          python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",5900),10); s.settimeout(15); s.recv(12); s.sendall(b"RFB 003.008\n"); n=s.recv(1)[0]; print("Security types:", list(s.recv(n)))'
-
       - name: Verify Real Desktop Frame Through VNC
         run: |
           sleep 5
@@ -107,11 +109,13 @@ jobs:
           /tmp/vncvenv/bin/pip install -q pycryptodome pillow websockify
           mkdir -p connection-details
           # Local screenshot (what WindowServer draws)
-          screencapture -x connection-details/local_screen.png || true
-          /tmp/vncvenv/bin/python -c "from PIL import Image,ImageStat as S; im=Image.open('connection-details/local_screen.png').convert('L'); st=S.Stat(im); print('Local screen', im.size, 'stddev=%.1f' % st.stddev[0])" || true
-          # Frame captured over VNC with password auth (exactly what RealVNC / noVNC receive)
-          perl -e 'alarm 120; exec @ARGV' /tmp/vncvenv/bin/python vnc_check.py "$MAC_PASSWORD" connection-details/vnc_frame.png \
-            && echo "VNC_OK=1" >> "$GITHUB_ENV" || echo "::warning::VNC frame check did not pass"
+          screencapture -x connection-details/1_local_screen.png || true
+          # Frame over VNC (exactly what RealVNC / noVNC receive), then unlock with the account password
+          perl -e 'alarm 150; exec @ARGV' /tmp/vncvenv/bin/python vnc_check.py "$MAC_PASSWORD" \
+            connection-details/2_vnc_frame.png "$MAC_PASSWORD" connection-details/3_vnc_after_unlock.png \
+            || echo "::warning::VNC frame check did not pass"
+          sleep 3
+          screencapture -x connection-details/4_local_after.png || true
 
       - name: Setup noVNC, Bore & Cloudflare
         run: |
