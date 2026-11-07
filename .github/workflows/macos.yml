@@ -1,59 +1,175 @@
-name: macOS Genuine Edition (Screen Sharing + Bore)
-
-# Black-screen fix based on a proven solution (actions/runner-images#9529,
-# huajideshutiao/legado ios-remote.yml): the runner image does not grant the
-# Screen Sharing service Screen-Recording / PostEvent / Accessibility in TCC,
-# so VNC authenticates but streams a black framebuffer. We write those grants
-# into the system TCC.db at runtime, never touch the runner's GUI session
-# (no password reset / auto-login / virtual display), and verify a real frame
-# through VNC before publishing the links.
+name: macOS Standalone Persistent Cloud (Auto-Renew + Telegram)
 
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: 'start = تشغيل وتجديد تلقائي | stop = إيقاف التجديد | reset = مسح البيانات والبدء من الصفر'
+        required: false
+        type: choice
+        options:
+          - start
+          - stop
+          - reset
+        default: 'start'
       password:
-        description: 'VNC password (first 8 chars are used by VNC, default: Mikey@2026)'
+        description: 'Password for RustDesk & VNC (default: Mikey@2026)'
         required: false
         default: 'Mikey@2026'
-      auto_restart:
-        description: 'Auto-restart workflow before timeout (6h)'
-        required: false
-        type: boolean
-        default: false
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: write
+  actions: write
 
 concurrency:
   group: vexor-macos-native
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
+  gatekeeper:
+    name: Check Persistent Session State
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      STATE_PASS: ${{ secrets.MACOS_STATE_KEY }}
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_ACTION: ${{ inputs.action || 'start' }}
+    steps:
+      - name: Evaluate State & Handle Stop/Reset
+        id: check
+        run: |
+          set -e
+          [ -z "$STATE_PASS" ] && STATE_PASS="${GH_REPO}-fallback-state-key"
+          export STATE_PASS
+          TAG="macos-persistent-state"
+
+          if ! gh release view "$TAG" -R "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GH_REPO" \
+              --title "macOS Persistent State (AES-256 Encrypted)" \
+              --notes "Automated encrypted state storage for macOS Cloud Desktop." >/dev/null
+          fi
+
+          python3 - <<'PY'
+          import json, os, subprocess, tempfile, time
+
+          repo = os.environ["GH_REPO"]
+          event = os.environ["EVENT_NAME"]
+          action = os.environ["INPUT_ACTION"]
+          tag = "macos-persistent-state"
+
+          def load_ctrl():
+              with tempfile.TemporaryDirectory() as d:
+                  r = subprocess.run(
+                      ["gh", "release", "download", tag, "-R", repo, "-p", "control.json.enc", "-D", d],
+                      capture_output=True, text=True
+                  )
+                  enc_path = os.path.join(d, "control.json.enc")
+                  if r.returncode != 0 or not os.path.exists(enc_path):
+                      return {"mode": "active", "chat_ids": []}
+                  dec = subprocess.run(
+                      ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-pass", "env:STATE_PASS", "-in", enc_path],
+                      capture_output=True
+                  )
+                  if dec.returncode != 0:
+                      return {"mode": "active", "chat_ids": []}
+                  try:
+                      return json.loads(dec.stdout.decode("utf-8"))
+                  except Exception:
+                      return {"mode": "active", "chat_ids": []}
+
+          def save_ctrl(ctrl):
+              ctrl["updated_at"] = int(time.time())
+              raw = json.dumps(ctrl).encode("utf-8")
+              with tempfile.TemporaryDirectory() as d:
+                  enc_path = os.path.join(d, "control.json.enc")
+                  enc = subprocess.run(
+                      ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt", "-pass", "env:STATE_PASS", "-out", enc_path],
+                      input=raw, capture_output=True
+                  )
+                  if enc.returncode == 0:
+                      subprocess.run(
+                          ["gh", "release", "upload", tag, enc_path, "--clobber", "-R", repo],
+                          check=False
+                      )
+
+          ctrl = load_ctrl()
+
+          if event == "workflow_dispatch":
+              if action == "stop":
+                  ctrl["mode"] = "stopped"
+                  save_ctrl(ctrl)
+                  print("Auto-renewal STOPPED by user.")
+                  should_run = "false"
+              elif action == "reset":
+                  rel = subprocess.run(
+                      ["gh", "release", "view", tag, "-R", repo, "--json", "assets"],
+                      capture_output=True, text=True
+                  )
+                  if rel.returncode == 0:
+                      for a in json.loads(rel.stdout).get("assets", []):
+                          name = a.get("name", "")
+                          if name.startswith("snap_") or name == "manifest.json.enc":
+                              subprocess.run(["gh", "release", "delete-asset", tag, name, "-y", "-R", repo], check=False)
+                  ctrl["mode"] = "active"
+                  save_ctrl(ctrl)
+                  print("Persistent state wiped; starting fresh macOS session.")
+                  should_run = "true"
+              else:
+                  ctrl["mode"] = "active"
+                  save_ctrl(ctrl)
+                  should_run = "true"
+          else:
+              # Scheduled auto-renewal check
+              mode = ctrl.get("mode", "active")
+              print(f"Scheduled check: current mode = {mode}")
+              should_run = "true" if mode == "active" else "false"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"should_run={should_run}\n")
+          PY
+
   macos-desktop:
-    name: Run Genuine macOS Desktop
+    name: Run Persistent Genuine macOS Desktop
+    needs: gatekeeper
+    if: needs.gatekeeper.outputs.should_run == 'true'
     runs-on: macos-latest
     timeout-minutes: 360
     env:
       MAC_PASSWORD: ${{ inputs.password || 'Mikey@2026' }}
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: System Diagnostics & GUI Session Check
+      - name: System Diagnostics, Baseline & Encrypted State Restore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          MACOS_STATE_KEY: ${{ secrets.MACOS_STATE_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         run: |
+          echo "::add-mask::$MAC_PASSWORD"
+          mkdir -p connection-details
+          exec > >(tee -a connection-details/diag.log) 2>&1
+
           sw_vers; uname -m
           sysctl -n machdep.cpu.brand_string || true
           echo "RAM: $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
           csrutil status || true
+
           CONSOLE_USER="$(scutil <<< 'show State:/Users/ConsoleUser' | awk '/Name :/ { print $3 }')"
           LOCKED="$(/usr/libexec/PlistBuddy -c 'print :IOConsoleUsers:0:CGSSessionScreenIsLocked' /dev/stdin 2>/dev/null <<< "$(ioreg -n Root -d1 -a)" || true)"
           echo "Console user : ${CONSOLE_USER:-<none>}"
           echo "Screen locked: ${LOCKED:-false}"
           echo "CONSOLE_USER=$CONSOLE_USER" >> "$GITHUB_ENV"
           if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "loginwindow" ] || [ "$LOCKED" = "true" ]; then
-            echo "::error::GUI session is not on the desktop (loginwindow/locked). Re-run the workflow."
+            echo "::error::GUI session is not on the desktop (loginwindow/locked)."
             exit 1
           fi
 
-          # Keep the desktop awake and unlocked for the whole session
+          # Keep desktop awake and unlocked
           sudo -u "$CONSOLE_USER" defaults -currentHost write com.apple.screensaver idleTime -int 0
           sudo -u "$CONSOLE_USER" defaults -currentHost write com.apple.screensaver askForPassword -int 0
           sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLockImmediate -bool true
@@ -61,10 +177,584 @@ jobs:
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
           nohup caffeinate -dimsu > /dev/null 2>&1 &
 
-      - name: Grant Screen Sharing TCC Permissions (Black Screen Fix)
+          # Save root-only runtime credentials for state sync & Telegram bot
+          STATE_KEY_VAL="${MACOS_STATE_KEY:-${GH_REPO}-fallback-state-key}"
+          sudo python3 - "$GH_TOKEN" "$GH_REPO" "$STATE_KEY_VAL" "$TG_BOT_TOKEN" "$CONSOLE_USER" "$MAC_PASSWORD" <<'PY'
+          import json, os, sys
+          cfg = {
+              "gh_token": sys.argv[1],
+              "gh_repo": sys.argv[2],
+              "state_pass": sys.argv[3],
+              "tg_token": sys.argv[4],
+              "console_user": sys.argv[5],
+              "mac_password": sys.argv[6],
+          }
+          p = "/var/root/.macos_state_env.json"
+          with open(p, "w") as f:
+              json.dump(cfg, f)
+          os.chmod(p, 0o600)
+          PY
+
+          # Install macos-state-tool (atomic AES-256 + zstd multi-part backup & restore)
+          sudo tee /usr/local/bin/macos-state-tool >/dev/null <<'PYEOF'
+          #!/usr/bin/env python3
+          import json, os, shutil, subprocess, sys, tempfile, time
+
+          os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.environ.get("PATH", "")
+          CFG = json.load(open("/var/root/.macos_state_env.json"))
+          ENV = os.environ.copy()
+          ENV["GH_TOKEN"] = CFG["gh_token"]
+          ENV["STATE_PASS"] = CFG["state_pass"]
+          REPO = CFG["gh_repo"]
+          USER = CFG["console_user"]
+          HOME = f"/Users/{USER}"
+          TAG = "macos-persistent-state"
+          BASELINE_FILE = "/var/tmp/macos_baseline.json"
+          RESTORED_TRACK = "/var/tmp/macos_restored_items.json"
+
+          SKIP_HOME_TOP = {
+              ".Trash", "Library", "Applications", "Desktop", "Documents", "Downloads",
+              "Pictures", "Movies", "Music", "Public", "work", "hostedtoolcache",
+              ".cache", ".npm", ".nvm", ".cargo", ".rustup", ".gradle", ".m2",
+              ".cocoapods", ".dotnet", ".swiftpm", ".gem", ".rbenv", ".pyenv"
+          }
+          EXPLICIT_DOTS = [
+              ".ssh", ".config", ".zshrc", ".zprofile", ".bashrc",
+              ".bash_profile", ".gitconfig", ".local"
+          ]
+          ALWAYS_SYNC_APPSUPPORT = {
+              "Google", "BraveSoftware", "Firefox", "Mozilla", "Microsoft Edge",
+              "Arc", "Code", "Cursor", "Telegram Desktop", "discord", "Slack",
+              "Obsidian", "VSCodium", "Sublime Text", "JetBrains"
+          }
+          SKIP_APPSUPPORT = {
+              "Apple", "Caches", "CrashReporter", "CloudDocs", "FileProvider",
+              "Knowledge", "MobileSync", "AddressBook", "CallHistoryDB",
+              "CallHistoryTransactions", "com.apple.TCC", "com.apple.spotlight",
+              "com.apple.sharedfilelist", "Xcode"
+          }
+          SKIP_PREF_PREFIXES = (
+              "com.apple.loginwindow", "com.apple.windowserver", "com.apple.security",
+              "com.apple.spaces", "com.apple.driver", "com.apple.Bluetooth"
+          )
+          CACHE_EXCLUDES = [
+              "--exclude=.DS_Store", "--exclude=Cache", "--exclude=Caches",
+              "--exclude=Code Cache", "--exclude=GPUCache", "--exclude=DawnCache",
+              "--exclude=ShaderCache", "--exclude=GrShaderCache", "--exclude=Crashpad",
+              "--exclude=CacheStorage", "--exclude=Service Worker/CacheStorage",
+              "--exclude=BrowserMetrics", "--exclude=Safe Browsing"
+          ]
+          SYSTEM_GUI_PROCS = {
+              "Finder", "loginwindow", "Dock", "SystemUIServer", "ControlCenter",
+              "WindowManager", "RustDesk", "CoreServicesUIAgent", "NotificationCenter",
+              "Spotlight", "UserNotificationCenter", "Setup Assistant", "SecurityAgent",
+              "TextInputMenuAgent", "TextInputSwitcher", "WiFiAgent", "AirPlayUIAgent"
+          }
+
+          def run(cmd, **kw):
+              return subprocess.run(cmd, env=ENV, **kw)
+
+          def enc_file(raw_bytes, out_path):
+              r = run(
+                  ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt", "-pass", "env:STATE_PASS", "-out", out_path],
+                  input=raw_bytes, capture_output=True
+              )
+              if r.returncode != 0:
+                  raise RuntimeError(r.stderr.decode(errors="replace"))
+
+          def dec_file(in_path):
+              r = run(
+                  ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-pass", "env:STATE_PASS", "-in", in_path],
+                  capture_output=True
+              )
+              if r.returncode != 0:
+                  return None
+              return r.stdout
+
+          def load_ctrl():
+              with tempfile.TemporaryDirectory() as d:
+                  r = run(["gh", "release", "download", TAG, "-R", REPO, "-p", "control.json.enc", "-D", d], capture_output=True)
+                  p = os.path.join(d, "control.json.enc")
+                  if r.returncode != 0 or not os.path.exists(p):
+                      return {"mode": "active", "chat_ids": []}
+                  raw = dec_file(p)
+                  if not raw:
+                      return {"mode": "active", "chat_ids": []}
+                  try:
+                      return json.loads(raw.decode("utf-8"))
+                  except Exception:
+                      return {"mode": "active", "chat_ids": []}
+
+          def save_ctrl(ctrl):
+              ctrl["updated_at"] = int(time.time())
+              with tempfile.TemporaryDirectory() as d:
+                  p = os.path.join(d, "control.json.enc")
+                  enc_file(json.dumps(ctrl).encode("utf-8"), p)
+                  run(["gh", "release", "upload", TAG, p, "--clobber", "-R", REPO], capture_output=True)
+
+          def list_dir(path):
+              try:
+                  return sorted(os.listdir(path))
+              except Exception:
+                  return []
+
+          def brew_list(kind):
+              r = run(["sudo", "-u", USER, "brew", "list", f"--{kind}"], capture_output=True, text=True)
+              return sorted(r.stdout.split()) if r.returncode == 0 else []
+
+          def do_baseline():
+              prefs_dir = os.path.join(HOME, "Library", "Preferences")
+              prefs = {}
+              for f in list_dir(prefs_dir):
+                  fp = os.path.join(prefs_dir, f)
+                  try:
+                      prefs[f] = int(os.path.getmtime(fp))
+                  except Exception:
+                      pass
+              data = {
+                  "apps": list_dir("/Applications"),
+                  "home_top": list_dir(HOME),
+                  "app_support": list_dir(os.path.join(HOME, "Library", "Application Support")),
+                  "prefs": prefs,
+                  "brew_formula": brew_list("formula"),
+                  "brew_cask": brew_list("cask"),
+              }
+              with open(BASELINE_FILE, "w") as f:
+                  json.dump(data, f)
+              with open("/var/tmp/baseline_done", "w") as f:
+                  f.write("1")
+              print(f"[baseline] Recorded {len(data['apps'])} apps, {len(data['app_support'])} AppSupport dirs.")
+
+          def do_restore():
+              with tempfile.TemporaryDirectory() as d:
+                  r = run(["gh", "release", "download", TAG, "-R", REPO, "-p", "manifest.json.enc", "-D", d], capture_output=True)
+                  mp = os.path.join(d, "manifest.json.enc")
+                  if r.returncode != 0 or not os.path.exists(mp):
+                      msg = "أول جلسة جديدة (جاهزة لحفظ جميع ملفاتك وتطبيقاتك تلقائيًا)"
+                      open("/var/tmp/restore_summary.txt", "w").write(msg)
+                      print("[restore] No previous snapshot yet — fresh session.")
+                      return
+                  raw = dec_file(mp)
+                  if not raw:
+                      msg = "تعذر فك تشفير النسخة السابقة — بدء جلسة جديدة"
+                      open("/var/tmp/restore_summary.txt", "w").write(msg)
+                      return
+                  manifest = json.loads(raw.decode("utf-8"))
+                  parts = manifest.get("parts", [])
+                  comp = manifest.get("comp", "gzip")
+                  if not parts:
+                      open("/var/tmp/restore_summary.txt", "w").write("تم التجهيز بنجاح ✅")
+                      return
+
+                  print(f"[restore] Downloading {len(parts)} encrypted part(s) ({manifest.get('size_mb', 0):.1f} MB)...")
+                  for part in parts:
+                      dr = run(["gh", "release", "download", TAG, "-R", REPO, "-p", part, "-D", d], capture_output=True, text=True)
+                      if dr.returncode != 0:
+                          print("[restore] Failed downloading part:", part, dr.stderr)
+                          return
+
+                  stage = os.path.join(d, "stage")
+                  os.makedirs(stage, exist_ok=True)
+                  part_paths = " ".join(f'"{os.path.join(d, p)}"' for p in parts)
+                  decomp = "zstd -d -T0" if (comp == "zstd" and shutil.which("zstd")) else "gzip -d"
+                  cmd = f"cat {part_paths} | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass env:STATE_PASS | {decomp} | tar -xf - -C \"{stage}\""
+                  tr = subprocess.run(["/bin/bash", "-o", "pipefail", "-c", cmd], env=ENV, capture_output=True, text=True)
+                  if tr.returncode != 0:
+                      print("[restore] Extraction error:", tr.stderr)
+                      return
+
+                  apps_stage = os.path.join(stage, "applications")
+                  restored_apps = []
+                  if os.path.isdir(apps_stage):
+                      for app in os.listdir(apps_stage):
+                          src = os.path.join(apps_stage, app)
+                          dst = os.path.join("/Applications", app)
+                          if os.path.exists(dst):
+                              shutil.rmtree(dst, ignore_errors=True)
+                          run(["cp", "-a", src, dst])
+                          run(["xattr", "-dr", "com.apple.quarantine", dst], capture_output=True)
+                          restored_apps.append(app)
+
+                  home_stage = os.path.join(stage, "user_home")
+                  if os.path.isdir(home_stage):
+                      run(["rsync", "-a", f"{home_stage}/", f"{HOME}/"])
+                      # Fix ownership on restored top-level & Library paths without touching giant Xcode dirs
+                      for item in os.listdir(home_stage):
+                          target = os.path.join(HOME, item)
+                          if item == "Library":
+                              for sub in os.listdir(os.path.join(home_stage, "Library")):
+                                  sub_p = os.path.join(HOME, "Library", sub)
+                                  run(["chown", "-R", f"{USER}:staff", sub_p], capture_output=True)
+                          else:
+                              run(["chown", "-R", f"{USER}:staff", target], capture_output=True)
+                      run(["killall", "cfprefsd", "secd"], capture_output=True)
+
+                  brew_added = manifest.get("brew_added", [])
+                  if brew_added:
+                      print(f"[restore] Re-installing Homebrew formulas: {brew_added}")
+                      run(["sudo", "-u", USER, "brew", "install", "--quiet"] + brew_added, capture_output=True)
+
+                  with open(RESTORED_TRACK, "w") as f:
+                      json.dump({
+                          "apps": restored_apps,
+                          "open_apps": manifest.get("open_apps", []),
+                      }, f)
+                  msg = f"تم استرجاع جميع ملفاتك وتطبيقاتك بالكامل ({manifest.get('size_mb', 0):.1f} MB) ✅"
+                  open("/var/tmp/restore_summary.txt", "w").write(msg)
+                  print(f"[restore] Completed! Restored apps: {restored_apps}")
+
+          def get_open_gui_apps():
+              r = run(
+                  ["sudo", "-u", USER, "osascript", "-e",
+                   'tell application "System Events" to get name of every application process whose background only is false'],
+                  capture_output=True, text=True
+              )
+              if r.returncode != 0:
+                  return []
+              names = [x.strip() for x in r.stdout.strip().split(",") if x.strip()]
+              return [n for n in names if n not in SYSTEM_GUI_PROCS]
+
+          def rsync_copy(src, dst):
+              if not os.path.exists(src):
+                  return
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              if os.path.isdir(src) and not os.path.islink(src):
+                  os.makedirs(dst, exist_ok=True)
+                  run(["rsync", "-a"] + CACHE_EXCLUDES + [f"{src}/", f"{dst}/"], capture_output=True)
+              else:
+                  run(["cp", "-a", src, dst], capture_output=True)
+
+          def do_backup(reason="periodic"):
+              if not os.path.exists(BASELINE_FILE):
+                  print("[backup] No baseline file, skipping.")
+                  return
+              base = json.load(open(BASELINE_FILE))
+              base_apps = set(base.get("apps", [])) | {"RustDesk.app"}
+              base_home = set(base.get("home_top", []))
+              base_as = set(base.get("app_support", []))
+              base_prefs = base.get("prefs", {})
+              base_brew = set(base.get("brew_formula", []))
+
+              open_apps = get_open_gui_apps() if reason in ("handover", "final") else []
+
+              with tempfile.TemporaryDirectory(dir="/var/tmp") as work:
+                  stage = os.path.join(work, "stage")
+                  u_stage = os.path.join(stage, "user_home")
+                  a_stage = os.path.join(stage, "applications")
+                  os.makedirs(u_stage, exist_ok=True)
+                  os.makedirs(a_stage, exist_ok=True)
+
+                  # 1. Personal folders
+                  for folder in ["Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Public", "Applications"]:
+                      src = os.path.join(HOME, folder)
+                      if os.path.isdir(src) and os.listdir(src):
+                          rsync_copy(src, os.path.join(u_stage, folder))
+
+                  # 2. Explicit dotfiles & newly created top-level items in $HOME
+                  for dot in EXPLICIT_DOTS:
+                      src = os.path.join(HOME, dot)
+                      if os.path.exists(src):
+                          rsync_copy(src, os.path.join(u_stage, dot))
+                  for item in list_dir(HOME):
+                      if item in SKIP_HOME_TOP or item in EXPLICIT_DOTS or item in base_home:
+                          continue
+                      rsync_copy(os.path.join(HOME, item), os.path.join(u_stage, item))
+
+                  # 3. ~/Library/Application Support (browsers, apps, user data)
+                  as_dir = os.path.join(HOME, "Library", "Application Support")
+                  for item in list_dir(as_dir):
+                      if item in SKIP_APPSUPPORT or item.startswith("com.apple."):
+                          continue
+                      if (item not in base_as) or (item in ALWAYS_SYNC_APPSUPPORT):
+                          rsync_copy(os.path.join(as_dir, item), os.path.join(u_stage, "Library", "Application Support", item))
+
+                  # 4. Safari, Cookies & Keychains
+                  for lib_sub in ["Safari", "Cookies", "Keychains"]:
+                      src = os.path.join(HOME, "Library", lib_sub)
+                      if os.path.exists(src):
+                          rsync_copy(src, os.path.join(u_stage, "Library", lib_sub))
+
+                  # 5. Modified & new Preferences + RustDesk config
+                  prefs_dir = os.path.join(HOME, "Library", "Preferences")
+                  for f in list_dir(prefs_dir):
+                      if f == "ByHost" or f.startswith(SKIP_PREF_PREFIXES):
+                          continue
+                      fp = os.path.join(prefs_dir, f)
+                      try:
+                          mt = int(os.path.getmtime(fp))
+                      except Exception:
+                          continue
+                      if f == "com.carriez.RustDesk" or (f not in base_prefs) or (mt > base_prefs.get(f, 0)):
+                          rsync_copy(fp, os.path.join(u_stage, "Library", "Preferences", f))
+
+                  # 6. Newly installed /Applications/*.app bundles
+                  for app in list_dir("/Applications"):
+                      if app not in base_apps and not app.startswith("."):
+                          rsync_copy(os.path.join("/Applications", app), os.path.join(a_stage, app))
+
+                  brew_added = sorted(set(brew_list("formula")) - base_brew)
+
+                  # Compress + AES-256 Encrypt + Split into <1.9GB chunks
+                  ts = int(time.time())
+                  prefix = f"snap_{ts}_part_"
+                  part_dir = os.path.join(work, "parts")
+                  os.makedirs(part_dir, exist_ok=True)
+                  use_zstd = bool(shutil.which("zstd"))
+                  comp_name = "zstd" if use_zstd else "gzip"
+                  comp_cmd = "zstd -1 -T0" if use_zstd else "gzip -1"
+
+                  pipe_cmd = (
+                      f"tar -cf - -C \"{stage}\" . | {comp_cmd} | "
+                      f"openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_PASS | "
+                      f"split -b 1900m - \"{os.path.join(part_dir, prefix)}\""
+                  )
+                  pr = subprocess.run(["/bin/bash", "-o", "pipefail", "-c", pipe_cmd], env=ENV, capture_output=True, text=True)
+                  if pr.returncode != 0:
+                      print("[backup] Archive pipeline failed:", pr.stderr)
+                      return
+
+                  parts = sorted(os.listdir(part_dir))
+                  total_bytes = sum(os.path.getsize(os.path.join(part_dir, p)) for p in parts)
+                  size_mb = total_bytes / (1024 * 1024)
+
+                  for p in parts:
+                      up = run(["gh", "release", "upload", TAG, os.path.join(part_dir, p), "--clobber", "-R", REPO], capture_output=True, text=True)
+                      if up.returncode != 0:
+                          print("[backup] Upload failed for", p, up.stderr)
+                          return
+
+                  manifest = {
+                      "ts": ts,
+                      "reason": reason,
+                      "comp": comp_name,
+                      "parts": parts,
+                      "size_mb": round(size_mb, 2),
+                      "brew_added": brew_added,
+                      "open_apps": open_apps,
+                  }
+                  mp = os.path.join(work, "manifest.json.enc")
+                  enc_file(json.dumps(manifest).encode("utf-8"), mp)
+                  up_m = run(["gh", "release", "upload", TAG, mp, "--clobber", "-R", REPO], capture_output=True, text=True)
+                  if up_m.returncode != 0:
+                      print("[backup] Manifest upload failed:", up_m.stderr)
+                      return
+
+                  # Prune older snap_* assets safely AFTER atomic manifest update
+                  rel = run(["gh", "release", "view", TAG, "-R", REPO, "--json", "assets"], capture_output=True, text=True)
+                  if rel.returncode == 0:
+                      keep = set(parts)
+                      for a in json.loads(rel.stdout).get("assets", []):
+                          name = a.get("name", "")
+                          if name.startswith("snap_") and name not in keep:
+                              run(["gh", "release", "delete-asset", TAG, name, "-y", "-R", REPO], capture_output=True)
+
+                  print(f"[backup:{reason}] Synced {len(parts)} part(s), {size_mb:.2f} MB encrypted, open_apps={open_apps}")
+
+          cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+          if cmd == "baseline":
+              do_baseline()
+          elif cmd == "restore":
+              do_restore()
+          elif cmd == "backup":
+              do_backup(sys.argv[2] if len(sys.argv) > 2 else "periodic")
+          elif cmd == "get-chats":
+              ctrl = load_ctrl()
+              print(json.dumps(ctrl.get("chat_ids", [])))
+          elif cmd == "add-chat":
+              cid = int(sys.argv[2])
+              ctrl = load_ctrl()
+              cids = ctrl.get("chat_ids", [])
+              if cid not in cids:
+                  cids.append(cid)
+                  ctrl["chat_ids"] = cids
+                  save_ctrl(ctrl)
+          elif cmd == "set-mode":
+              ctrl = load_ctrl()
+              ctrl["mode"] = sys.argv[2]
+              save_ctrl(ctrl)
+          PYEOF
+          sudo chmod +x /usr/local/bin/macos-state-tool
+
+          # Install Telegram Bot daemon (auto-discovers chat_id, pushes renewal IPs & handles /ip /save /status /stop)
+          sudo tee /usr/local/bin/macos-tg-bot >/dev/null <<'PYEOF'
+          #!/usr/bin/env python3
+          import html, json, os, shutil, subprocess, sys, time, urllib.parse, urllib.request
+
+          CFG = json.load(open("/var/root/.macos_state_env.json"))
+          TOKEN = CFG.get("tg_token", "").strip()
+          if not TOKEN:
+              print("[tg] No TG_BOT_TOKEN configured, exiting.")
+              sys.exit(0)
+
+          API = f"https://api.telegram.org/bot{TOKEN}"
+          QUEUE_DIR = "/var/tmp/notify_queue"
+          os.makedirs(QUEUE_DIR, exist_ok=True)
+
+          def tg_call(method, payload=None, timeout=20):
+              url = f"{API}/{method}"
+              data = json.dumps(payload).encode("utf-8") if payload is not None else None
+              headers = {"Content-Type": "application/json"} if data else {}
+              req = urllib.request.Request(url, data=data, headers=headers)
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          def load_chats():
+              r = subprocess.run(["/usr/local/bin/macos-state-tool", "get-chats"], capture_output=True, text=True)
+              try:
+                  return set(json.loads(r.stdout.strip()))
+              except Exception:
+                  return set()
+
+          def save_chat(cid):
+              subprocess.run(["/usr/local/bin/macos-state-tool", "add-chat", str(cid)], check=False)
+
+          def format_conn_card(header="🍎 تم تشغيل وتجهيز جهاز macOS بنجاح!"):
+              try:
+                  c = json.load(open("/var/tmp/current_conn.json"))
+              except Exception:
+                  return "⏳ جاري تجهيز بيانات الاتصال..."
+              rem_min = max(0, int((c["end_epoch"] - time.time()) / 60))
+              hrs, mins = divmod(rem_min, 60)
+              return (
+                  f"<b>{html.escape(header)}</b>\n\n"
+                  f"⚡ <b>اتصال RustDesk المباشر (بدون حساب - الأسرع):</b>\n"
+                  f"• Remote ID: <code>{html.escape(c['rd_addr'])}</code>\n"
+                  f"• Password: <code>{html.escape(c['password'])}</code>\n\n"
+                  f"🌐 <b>رابط المتصفح المباشر (HTTPS):</b>\n"
+                  f"{html.escape(c['cf_full'])}\n\n"
+                  f"🖥 <b>اتصال VNC بديل:</b> <code>{html.escape(c['vnc_addr'])}</code>\n\n"
+                  f"📦 <b>حالة البيانات:</b> {html.escape(c['restore_msg'])}\n"
+                  f"⏳ <b>التجديد التلقائي القادم:</b> بعد {hrs} ساعة و {mins} دقيقة\n\n"
+                  f"💡 <b>أوامر التحكم من التليجرام:</b>\n"
+                  f"/ip — عرض الـ IP والروابط الحالية\n"
+                  f"/save — حفظ نسخة فورية لملفاتك الآن\n"
+                  f"/status — حالة الجهاز والمساحة والوقت\n"
+                  f"/stop — حفظ البيانات وإيقاف التجديد التلقائي"
+              )
+
+          def send_msg(cid, text):
+              try:
+                  tg_call("sendMessage", {
+                      "chat_id": cid,
+                      "text": text,
+                      "parse_mode": "HTML",
+                      "disable_web_page_preview": True,
+                  })
+                  return True
+              except Exception as e:
+                  print(f"[tg] sendMessage to {cid} failed: {e}", flush=True)
+                  return False
+
+          try:
+              me = tg_call("getMe")
+              bot_user = me.get("result", {}).get("username", "unknown")
+              print(f"[tg] Connected to Telegram Bot: @{bot_user}", flush=True)
+              tg_call("deleteWebhook", {"drop_pending_updates": False})
+          except Exception as e:
+              print(f"[tg] Failed connecting to Telegram API: {e}", flush=True)
+              sys.exit(1)
+
+          chats = load_chats()
+          offset = 0
+
+          # Initial poll to discover chat_id if user already messaged the bot
+          try:
+              ups = tg_call("getUpdates", {"timeout": 2}, timeout=10).get("result", [])
+              for u in ups:
+                  offset = max(offset, u["update_id"] + 1)
+                  msg = u.get("message") or u.get("edited_message") or u.get("my_chat_member") or {}
+                  cid = msg.get("chat", {}).get("id")
+                  if cid and cid not in chats:
+                      chats.add(cid)
+                      save_chat(cid)
+                      print(f"[tg] Discovered & saved chat_id: {cid}", flush=True)
+          except Exception as e:
+              print(f"[tg] Initial getUpdates warning: {e}", flush=True)
+
+          startup_sent = False
+          if chats:
+              card = format_conn_card("🍎 جهاز macOS جاهز الآن (تم نقل واسترجاع بياناتك)!")
+              for cid in list(chats):
+                  if send_msg(cid, card):
+                      startup_sent = True
+              print(f"[tg] Startup notification sent to {len(chats)} chat(s).", flush=True)
+          else:
+              print(f"[tg] No chat_id saved yet — send /start to @{bot_user} on Telegram to link!", flush=True)
+
+          while True:
+              # Flush any queued system notifications (tunnel port changes, handover alerts)
+              for fn in sorted(os.listdir(QUEUE_DIR)):
+                  fp = os.path.join(QUEUE_DIR, fn)
+                  try:
+                      txt = open(fp).read().strip()
+                      os.remove(fp)
+                      if txt and chats:
+                          for cid in list(chats):
+                              send_msg(cid, txt)
+                  except Exception:
+                      pass
+
+              try:
+                  ups = tg_call("getUpdates", {"offset": offset, "timeout": 15}, timeout=25).get("result", [])
+                  for u in ups:
+                      offset = max(offset, u["update_id"] + 1)
+                      msg = u.get("message") or {}
+                      cid = msg.get("chat", {}).get("id")
+                      text = (msg.get("text") or "").strip()
+                      if not cid:
+                          mc = u.get("my_chat_member", {}).get("chat", {}).get("id")
+                          if mc and mc not in chats:
+                              chats.add(mc)
+                              save_chat(mc)
+                              send_msg(mc, format_conn_card())
+                          continue
+                      is_new = cid not in chats
+                      if is_new:
+                          chats.add(cid)
+                          save_chat(cid)
+                          print(f"[tg] Linked new chat_id: {cid}", flush=True)
+
+                      cmd = text.split()[0].lower() if text else ""
+                      if is_new or cmd in ("/start", "/ip", "ايبي", "ip"):
+                          send_msg(cid, format_conn_card())
+                      elif cmd in ("/save", "حفظ"):
+                          send_msg(cid, "⏳ جاري حفظ وتشفير جميع ملفاتك وتطبيقاتك الآن...")
+                          subprocess.run(["/usr/local/bin/macos-state-tool", "backup", "manual"], check=False)
+                          send_msg(cid, "✅ تم حفظ نسخة مشفرة محدثة لجميع بياناتك بنجاح!")
+                      elif cmd in ("/status", "حالة"):
+                          c = json.load(open("/var/tmp/current_conn.json"))
+                          rem_min = max(0, int((c["end_epoch"] - time.time()) / 60))
+                          hrs, mins = divmod(rem_min, 60)
+                          du = shutil.disk_usage("/")
+                          free_gb = du.free / (1024 ** 3)
+                          ver = subprocess.check_output(["sw_vers", "-productVersion"], text=True).strip()
+                          send_msg(
+                              cid,
+                              f"🖥 <b>حالة جهاز macOS {html.escape(ver)}</b>\n"
+                              f"• RustDesk IP: <code>{html.escape(c['rd_addr'])}</code>\n"
+                              f"• المساحة الفارغة: <code>{free_gb:.1f} GB</code>\n"
+                              f"• التجديد التلقائي القادم خلال: <b>{hrs} ساعة و {mins} دقيقة</b>"
+                          )
+                      elif cmd in ("/stop", "ايقاف"):
+                          send_msg(cid, "⏳ جاري حفظ جميع ملفاتك وإيقاف التجديد التلقائي...")
+                          subprocess.run(["/usr/local/bin/macos-state-tool", "set-mode", "stopped"], check=False)
+                          subprocess.run(["/usr/local/bin/macos-state-tool", "backup", "final"], check=False)
+                          open("/var/tmp/handover_saved", "w").write("1")
+                          open("/var/tmp/stop_requested", "w").write("1")
+                          send_msg(cid, "⏹ تم حفظ جميع بياناتك وإيقاف النظام بنجاح. تقدر تشغله في أي وقت من GitHub Actions وهيرجع زي ما كان بالظبط!")
+              except Exception as e:
+                  time.sleep(5)
+          PYEOF
+          sudo chmod +x /usr/local/bin/macos-tg-bot
+
+          # 1) Record clean VM baseline BEFORE restoring user state
+          sudo /usr/local/bin/macos-state-tool baseline
+          # 2) Restore encrypted user files, apps, browser logins, configs & preferences
+          sudo /usr/local/bin/macos-state-tool restore
+
+      - name: Grant Screen Sharing TCC Permissions
         run: |
           DB="/Library/Application Support/com.apple.TCC/TCC.db"
-          # Named-column insert: macOS 14+ added extra columns, positional VALUES would break
           COLS="service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified"
           for CLIENT in \
             "com.apple.screensharing.agent|0" \
@@ -78,21 +768,13 @@ jobs:
               sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access($COLS) VALUES('$SVC','$NAME',$TYPE,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$(date +%s));" || true
             done
           done
-          sudo sqlite3 "$DB" "SELECT service,client,auth_value FROM access WHERE client LIKE '%screensharing%' OR client LIKE '%ARDAgent%' OR client LIKE '%RemoteDesktop%';"
           sudo killall tccd || true
 
       - name: Enable Apple Screen Sharing (VNC)
         run: |
-          dscl . -read /Users/$CONSOLE_USER RealName UniqueID 2>/dev/null || true
-          # macOS shows its lock screen to VNC-password viewers; give the console
-          # account a known password so it can be unlocked from the viewer.
           sudo sysadminctl -resetPasswordFor "$CONSOLE_USER" -newPassword "$MAC_PASSWORD" 2>&1 | grep -v -- "----" || true
-          dscl . -authonly "$CONSOLE_USER" "$MAC_PASSWORD" && echo "Console user password set OK" || echo "::warning::console password check failed"
-          # Extra admin account for clients that ask for username (ARD auth)
           sudo sysadminctl -addUser mikey -fullName "Mikey" -password "$MAC_PASSWORD" -admin 2>&1 | grep -v -- "----" || true
 
-          # Skip Setup Assistant (Apple ID / "Create account" screens) for mikey so the
-          # first login goes straight to the desktop with no Apple account needed.
           sudo touch /var/db/.AppleSetupDone
           MH=/Users/mikey
           sudo mkdir -p "$MH/Library/Preferences"
@@ -117,10 +799,8 @@ jobs:
           done
           sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || { echo "::error::Screen Sharing not listening on 5900"; exit 1; }
 
-      - name: Performance Tuning (no animations, cursor, low CPU)
+      - name: Performance Tuning (Smooth UI & Refresh Restored Desktop)
         run: |
-          # The runner has no GPU, so every animation/blur is software-rendered and shows as lag
-          # over VNC. Turn them off for both the console user and mikey.
           for U in "$CONSOLE_USER" mikey; do
             id "$U" >/dev/null 2>&1 || continue
             D="sudo -u $U defaults"
@@ -145,7 +825,6 @@ jobs:
             $D write com.apple.Accessibility ReduceMotionEnabled -int 1
           done
           sudo killall Dock Finder 2>/dev/null || true
-          # Background CPU hogs on a 3-core VM
           sudo mdutil -a -i off 2>/dev/null || true
           sudo launchctl bootout system/com.apple.metadata.mds 2>/dev/null || true
           for A in com.apple.photoanalysisd com.apple.mediaanalysisd com.apple.suggestd com.apple.knowledge-agent com.apple.biomesyncd; do
@@ -155,18 +834,7 @@ jobs:
           sudo pkill -x mediaanalysisd 2>/dev/null || true
           sudo pkill -x softwareupdated 2>/dev/null || true
 
-      - name: Verify Real Desktop Frame Through VNC
-        run: |
-          mkdir -p connection-details
-          exec > >(tee -a connection-details/diag.log) 2>&1
-          sleep 2
-          python3 -m venv /tmp/vncvenv
-          /tmp/vncvenv/bin/pip install -q pycryptodome pillow websockify
-          screencapture -x connection-details/1_local_screen.png || true
-          echo "== Quick VNC Frame Verification =="
-          perl -e 'alarm(35);exec(@ARGV)' /tmp/vncvenv/bin/python vnc_check.py vnc "$MAC_PASSWORD" connection-details/2_vnc_password.png || true
-
-      - name: Install & Start RustDesk (fast H.264/VP9 remote, full mouse/keyboard)
+      - name: Install & Start RustDesk + Re-open Restored Apps
         run: |
           mkdir -p connection-details
           exec > >(tee -a connection-details/diag.log) 2>&1
@@ -179,19 +847,14 @@ jobs:
           sudo chown -R root:wheel /Applications/RustDesk.app || true
           BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /Applications/RustDesk.app/Contents/Info.plist)
           UIDN=$(id -u "$CONSOLE_USER")
-          echo "Bundle id: $BID | Console UID: $UIDN ($CONSOLE_USER)"
 
-          # Extract real code-signing requirement blob (csreq) for signed bundle TCC matching
           REQ=$(codesign -dr - /Applications/RustDesk.app 2>&1 | awk -F ' => ' '/=>/{print $2}')
           if [ -n "$REQ" ] && csreq -r "$REQ" -b /tmp/rd.csreq 2>/dev/null; then
             CSHEX="X'$(xxd -p /tmp/rd.csreq | tr -d '\n')'"
           else
             CSHEX="NULL"
           fi
-          echo "CSREQ blob length: ${#CSHEX}"
 
-          # Grant ScreenCapture, Accessibility, PostEvent & ListenEvent to RustDesk bundles,
-          # binaries, AND runner responsible processes so CGEventPost mouse/key events are never dropped
           COLS="service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified"
           NOW=$(date +%s)
           for DB in "/Library/Application Support/com.apple.TCC/TCC.db" "/Users/$CONSOLE_USER/Library/Application Support/com.apple.TCC/TCC.db"; do
@@ -216,7 +879,6 @@ jobs:
             done
           done
 
-          # Pre-approve macOS 15+ replayd screen capture prompt so no dialog steals focus
           REPLAY_DIR="/Users/$CONSOLE_USER/Library/Group Containers/group.com.apple.replayd"
           sudo -u "$CONSOLE_USER" mkdir -p "$REPLAY_DIR" || true
           REPLAY_PLIST="$REPLAY_DIR/ScreenCaptureApprovals.plist"
@@ -226,10 +888,16 @@ jobs:
           sudo killall tccd cfprefsd 2>/dev/null || true
           sleep 2
 
-          # Write full-control + Direct IP config for both console user and root (synced like install.scpt)
-          for CFG in "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk" "/var/root/Library/Preferences/com.carriez.RustDesk"; do
-            sudo mkdir -p "$CFG"
-            printf "password = '%s'\n" "$MAC_PASSWORD" | sudo tee "$CFG/RustDesk.toml" >/dev/null
+          # Preserve restored RustDesk identity (RustDesk.toml) if present, enforce full-control options
+          USER_RD_CFG="/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk"
+          ROOT_RD_CFG="/var/root/Library/Preferences/com.carriez.RustDesk"
+          sudo mkdir -p "$USER_RD_CFG" "$ROOT_RD_CFG"
+          if [ ! -f "$USER_RD_CFG/RustDesk.toml" ]; then
+            printf "password = '%s'\n" "$MAC_PASSWORD" | sudo tee "$USER_RD_CFG/RustDesk.toml" >/dev/null
+          fi
+          sudo cp -f "$USER_RD_CFG/RustDesk.toml" "$ROOT_RD_CFG/RustDesk.toml" || true
+
+          for CFG in "$USER_RD_CFG" "$ROOT_RD_CFG"; do
             sudo tee "$CFG/RustDesk2.toml" >/dev/null <<'TOML'
           [options]
           direct-server = 'Y'
@@ -247,14 +915,9 @@ jobs:
           show-remote-cursor = 'Y'
           TOML
           done
-          sudo chown -R "$CONSOLE_USER":staff "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk" || true
-
-          # Disable macOS Application Firewall so incoming local/direct connections are never blocked
+          sudo chown -R "$CONSOLE_USER":staff "$USER_RD_CFG" || true
           sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off 2>/dev/null || true
 
-          # Install official RustDesk LaunchDaemon + Aqua LaunchAgent (exact match to install.scpt)
-          # Running --server via Aqua LaunchAgent ensures launchd (not runner shell) is the responsible
-          # GUI process, enabling full Cocoa main-thread mouse & keyboard event posting.
           sudo tee /Library/LaunchDaemons/com.carriez.RustDesk_service.plist >/dev/null <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -342,61 +1005,44 @@ jobs:
             sleep 2
           done
 
-          # Set permanent password via CLI and sync config between user and root
           sudo /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "$MAC_PASSWORD" 2>&1 | tail -2 || true
           sudo -u "$CONSOLE_USER" /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "$MAC_PASSWORD" 2>&1 | tail -2 || true
-          sudo cp -f "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk/RustDesk.toml" "/var/root/Library/Preferences/com.carriez.RustDesk/RustDesk.toml" 2>/dev/null || true
-          sudo chown -R "$CONSOLE_USER":staff "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk" || true
+          sudo cp -f "$USER_RD_CFG/RustDesk.toml" "$ROOT_RD_CFG/RustDesk.toml" 2>/dev/null || true
+          sudo chown -R "$CONSOLE_USER":staff "$USER_RD_CFG" || true
 
-          # Open RustDesk main window briefly to verify zero service/permission warnings in screenshot
-          sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" open -a /Applications/RustDesk.app || true
-          sleep 5
-
-          echo "=== RustDesk Direct IP Port 21118 Listener & LaunchAgent Status ==="
+          echo "=== RustDesk Port 21118 Listener ==="
           sudo lsof -nP -iTCP:21118 -sTCP:LISTEN || true
-          sudo launchctl print "gui/$UIDN/com.carriez.RustDesk_server" 2>&1 | head -n 25 || true
-
-          echo "=== Live macOS CGEvent Input Self-Test ==="
-          sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" /usr/bin/python3 - <<'PY' || true
-          import ctypes, time
-          cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-          app = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
-          cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
-          cg.CGPreflightPostEventAccess.restype = ctypes.c_bool
-          app.AXIsProcessTrusted.restype = ctypes.c_bool
-          class CGPoint(ctypes.Structure):
-              _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
-          cg.CGEventCreate.argtypes = [ctypes.c_void_p]
-          cg.CGEventCreate.restype = ctypes.c_void_p
-          cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
-          cg.CGEventGetLocation.restype = CGPoint
-          cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
-          cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
-          cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-          p0 = cg.CGEventGetLocation(cg.CGEventCreate(None))
-          ev = cg.CGEventCreateMouseEvent(None, 5, CGPoint(420.0, 310.0), 0)
-          cg.CGEventPost(0, ev)
-          time.sleep(0.2)
-          p1 = cg.CGEventGetLocation(cg.CGEventCreate(None))
-          print(f"ScreenCapture={cg.CGPreflightScreenCaptureAccess()} PostEvent={cg.CGPreflightPostEventAccess()} AXTrusted={app.AXIsProcessTrusted()}")
-          print(f"Cursor before=({p0.x:.1f},{p0.y:.1f}) after=({p1.x:.1f},{p1.y:.1f})")
-          PY
 
           RD_ID=""
           for i in $(seq 1 15); do
             RD_ID=$(sudo -u "$CONSOLE_USER" /Applications/RustDesk.app/Contents/MacOS/RustDesk --get-id 2>/dev/null | tr -dc '0-9' )
-            [ -z "$RD_ID" ] && RD_ID=$(grep -E "^id *=" "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk/RustDesk.toml" 2>/dev/null | grep -oE "[0-9]{6,}" )
+            [ -z "$RD_ID" ] && RD_ID=$(grep -E "^id *=" "$USER_RD_CFG/RustDesk.toml" 2>/dev/null | grep -oE "[0-9]{6,}" )
             [ -n "$RD_ID" ] && break
             sleep 2
           done
-          echo "RustDesk ID: $RD_ID"
           echo "RD_ID=$RD_ID" >> "$GITHUB_ENV"
-          screencapture -x connection-details/7_rustdesk_running.png || true
-          # Close the RustDesk welcome window so the user lands on a clean desktop ready to use
-          osascript -e 'tell application "System Events" to tell process "RustDesk" to click button 1 of window 1' 2>/dev/null || true
+
+          # Re-open user GUI apps that were open at the end of the previous 6-hour session
+          if [ -f /var/tmp/macos_restored_items.json ]; then
+            python3 - "$UIDN" "$CONSOLE_USER" <<'PY' || true
+          import json, subprocess, sys
+          uidn, user = sys.argv[1], sys.argv[2]
+          info = json.load(open("/var/tmp/macos_restored_items.json"))
+          for app in info.get("open_apps", []):
+              print(f"Re-opening previous session app: {app}")
+              subprocess.run(["sudo", "launchctl", "asuser", uidn, "sudo", "-u", user, "open", "-a", app], check=False)
+          PY
+          fi
+          if [ -f "/Users/$CONSOLE_USER/.config/macos-autostart.sh" ]; then
+            sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" /bin/bash "/Users/$CONSOLE_USER/.config/macos-autostart.sh" >/tmp/user_autostart.log 2>&1 &
+          fi
+          sleep 3
+          screencapture -x connection-details/desktop_ready.png || true
 
       - name: Setup noVNC, Bore & Cloudflare
         run: |
+          python3 -m venv /tmp/vncvenv
+          /tmp/vncvenv/bin/pip install -q websockify
           retry() { for i in 1 2 3 4 5 6; do "$@" && return 0; echo "retry $i: $*"; sleep 10; done; return 1; }
           get_novnc() { rm -rf /tmp/novnc && git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc; }
           retry get_novnc
@@ -409,8 +1055,9 @@ jobs:
           sudo mv bore cloudflared /usr/local/bin/
           sudo chmod +x /usr/local/bin/bore /usr/local/bin/cloudflared
 
-      - name: Launch Tunnels & Generate Credentials
+      - name: Launch Tunnels & Push Telegram Connection Alert
         run: |
+          mkdir -p connection-details
           nohup bore local 21118 --to bore.pub > /tmp/bore_rd.log 2>&1 &
           nohup bore local 5900 --to bore.pub > /tmp/bore_vnc.log 2>&1 &
           nohup cloudflared tunnel --protocol http2 --url http://127.0.0.1:6080 > /tmp/cf.log 2>&1 &
@@ -422,11 +1069,31 @@ jobs:
             sleep 1
           done
           BORE_IP=$(python3 -c "import socket; print(socket.gethostbyname('bore.pub'))" 2>/dev/null || echo "bore.pub")
-          echo "RD_PORT=$RD_PORT" >> "$GITHUB_ENV"
-          echo "VNC_PORT=$VNC_PORT" >> "$GITHUB_ENV"
+          END_EPOCH=$(( $(date +%s) + 345 * 60 ))
+          echo "END_EPOCH=$END_EPOCH" >> "$GITHUB_ENV"
+          echo "BORE_IP=$BORE_IP" >> "$GITHUB_ENV"
+
+          RESTORE_MSG="$(cat /var/tmp/restore_summary.txt 2>/dev/null || echo 'جاهز للعمل')"
+          CF_FULL="${CF_URL}/vnc.html?autoconnect=true&resize=scale&show_dot=true&quality=5&compression=3"
+
+          python3 - "$BORE_IP" "$RD_PORT" "$VNC_PORT" "$CF_FULL" "$MAC_PASSWORD" "$RD_ID" "$RESTORE_MSG" "$END_EPOCH" <<'PY'
+          import json, sys
+          data = {
+              "rd_addr": f"{sys.argv[1]}:{sys.argv[2]}",
+              "rd_port": sys.argv[2],
+              "vnc_addr": f"bore.pub:{sys.argv[3]}",
+              "cf_full": sys.argv[4],
+              "password": sys.argv[5],
+              "rd_id": sys.argv[6],
+              "restore_msg": sys.argv[7],
+              "end_epoch": int(sys.argv[8]),
+          }
+          with open("/var/tmp/current_conn.json", "w") as f:
+              json.dump(data, f)
+          PY
 
           cat > connection-details/CREDENTIALS.md <<EOF
-          # Genuine Apple macOS Remote Desktop
+          # Persistent Genuine Apple macOS Cloud Desktop
 
           ## 0. RustDesk Direct IP (NO ACCOUNT / NO LOGIN NEEDED - FASTEST)
           Enter in Remote ID box: ${BORE_IP}:${RD_PORT}
@@ -435,16 +1102,20 @@ jobs:
           (Optional numeric ID if signed in: ${RD_ID})
 
           ## 1. Browser (HTTPS, one click)
-          ${CF_URL}/vnc.html?autoconnect=true&resize=scale&show_dot=true&quality=5&compression=3
+          ${CF_FULL}
 
           ## 2. RealVNC Viewer / TigerVNC
           Address : bore.pub:${VNC_PORT}
           Password: ${MAC_PASSWORD}
 
-          Console user: ${CONSOLE_USER}  |  Extra admin user: mikey / ${MAC_PASSWORD}
+          State: ${RESTORE_MSG}
           EOF
-          cat connection-details/CREDENTIALS.md
-          cat connection-details/CREDENTIALS.md >> "$GITHUB_STEP_SUMMARY"
+
+          # Launch Telegram Bot daemon & log bot connection status
+          sudo nohup /usr/local/bin/macos-tg-bot > /tmp/tg_bot.log 2>&1 &
+          sleep 6
+          echo "=== Telegram Bot Status ===" | tee -a connection-details/diag.log
+          cat /tmp/tg_bot.log | tee -a connection-details/diag.log || true
 
       - name: Upload Connection Details & Screenshots
         if: always()
@@ -454,35 +1125,96 @@ jobs:
           path: connection-details/
           retention-days: 1
 
-      - name: Keep macOS Session Alive
+      - name: Keep Alive, Periodic 15m Backup & Seamless 6h Auto-Renewal
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AUTO_RESTART: ${{ inputs.auto_restart }}
+          GH_REPO: ${{ github.repository }}
         run: |
           UIDN=$(id -u "$CONSOLE_USER")
-          END=$(( $(date +%s) + 350 * 60 ))
-          while [ "$(date +%s)" -lt "$END" ]; do
+          LOOPS=0
+          CUR_RD_PORT=$(python3 -c 'import json; print(json.load(open("/var/tmp/current_conn.json"))["rd_port"])')
+
+          while [ "$(date +%s)" -lt "$END_EPOCH" ]; do
+            [ -f /var/tmp/stop_requested ] && { echo "[*] Stop requested via Telegram."; break; }
+
             sudo pkill -u mikey -x "Setup Assistant" 2>/dev/null || true
             sudo pkill -u mikey -f "SetupAssistant" 2>/dev/null || true
+
             if ! sudo lsof -nP -iTCP:21118 -sTCP:LISTEN >/dev/null 2>&1; then
-              echo "[!] RustDesk 21118 not listening, kickstarting Aqua LaunchAgent"
               sudo launchctl kickstart -k "gui/$UIDN/com.carriez.RustDesk_server" 2>/dev/null || true
             fi
-            if ! pgrep -f "bore local 21118" > /dev/null; then
-              echo "[!] bore 21118 died, restarting"
-              nohup bore local 21118 --to bore.pub >> /tmp/bore_rd.log 2>&1 &
+
+            if ! pgrep -f "macos-tg-bot" >/dev/null 2>&1; then
+              sudo nohup /usr/local/bin/macos-tg-bot >> /tmp/tg_bot.log 2>&1 &
             fi
+
+            CHANGED=0
+            if ! pgrep -f "bore local 21118" > /dev/null; then
+              rm -f /tmp/bore_rd.log
+              nohup bore local 21118 --to bore.pub > /tmp/bore_rd.log 2>&1 &
+              sleep 6
+              NEW_RD=$(grep -oE "listening at bore.pub:[0-9]+" /tmp/bore_rd.log | head -1 | cut -d: -f2)
+              if [ -n "$NEW_RD" ] && [ "$NEW_RD" != "$CUR_RD_PORT" ]; then
+                CUR_RD_PORT="$NEW_RD"
+                CHANGED=1
+              fi
+            fi
+
             if ! pgrep -f "bore local 5900" > /dev/null; then
-              echo "[!] bore died, restarting (port may change)"
               nohup bore local 5900 --to bore.pub >> /tmp/bore_vnc.log 2>&1 &
             fi
+
             if ! pgrep -f "cloudflared tunnel" > /dev/null; then
-              echo "[!] cloudflared died, restarting (URL will change)"
               nohup cloudflared tunnel --protocol http2 --url http://127.0.0.1:6080 > /tmp/cf.log 2>&1 &
-              sleep 15; grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/cf.log | head -1
+              sleep 10
+              CHANGED=1
             fi
+
+            if [ "$CHANGED" -eq 1 ]; then
+              CF_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/cf.log | tail -1)
+              python3 - "$BORE_IP" "$CUR_RD_PORT" "$CF_URL" <<'PY' || true
+          import json, sys, time
+          c = json.load(open("/var/tmp/current_conn.json"))
+          c["rd_port"] = sys.argv[2]
+          c["rd_addr"] = f"{sys.argv[1]}:{sys.argv[2]}"
+          if sys.argv[3]:
+              c["cf_full"] = f"{sys.argv[3]}/vnc.html?autoconnect=true&resize=scale&show_dot=true&quality=5&compression=3"
+          json.dump(c, open("/var/tmp/current_conn.json", "w"))
+          msg = (
+              f"🔔 <b>تم تحديث بورت الاتصال تلقائيًا:</b>\n"
+              f"• RustDesk ID: <code>{c['rd_addr']}</code>\n"
+              f"• Password: <code>{c['password']}</code>\n"
+              f"• Browser: {c['cf_full']}"
+          )
+          open(f"/var/tmp/notify_queue/{int(time.time())}_port.txt", "w").write(msg)
+          PY
+            fi
+
             sleep 60
+            LOOPS=$((LOOPS + 1))
+
+            # Periodic background snapshot every 15 minutes
+            if [ $((LOOPS % 15)) -eq 0 ] && [ ! -f /var/tmp/stop_requested ]; then
+              sudo /usr/local/bin/macos-state-tool backup periodic || true
+            fi
           done
-          if [ "$AUTO_RESTART" = "true" ]; then
-            gh workflow run macos.yml --ref main || true
+
+          # Seamless 6-hour handover when timer reaches 345 minutes
+          if [ ! -f /var/tmp/stop_requested ]; then
+            cat > "/var/tmp/notify_queue/$(date +%s)_handover.txt" <<'EOF'
+          🔄 <b>جاري التجديد التلقائي لدورة الـ 6 ساعات الجديدة...</b>
+          تم حفظ جميع ملفاتك وتطبيقاتك وجلسات المتصفح بالكامل، وهيوصلك الـ IP الجديد هنا خلال دقيقتين تلقائيًا!
+          EOF
+            sleep 5
+            sudo /usr/local/bin/macos-state-tool backup handover || true
+            sudo touch /var/tmp/handover_saved
+            gh workflow run macos.yml -R "$GH_REPO" --ref "${GITHUB_REF_NAME:-main}" 2>/dev/null || true
+          fi
+
+      - name: Final Emergency State Save (On Manual Restart / Cancel)
+        if: always()
+        run: |
+          if [ -f /var/tmp/baseline_done ] && [ ! -f /var/tmp/handover_saved ]; then
+            echo "[*] Saving final state snapshot before runner shutdown..."
+            sudo /usr/local/bin/macos-state-tool backup final || true
           fi
