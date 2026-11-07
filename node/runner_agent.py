@@ -766,6 +766,24 @@ def main() -> int:
         return 1
 
     print(f"::add-mask::{DB_KEY}", flush=True)
+    cycle_env = int(os.environ.get("NODE_CYCLE") or "1")
+    if SERVER_ID == "SELFTEST" and cycle_env == 1:
+        test_spec = {
+            "server_id": "SELFTEST",
+            "user_id": 0,
+            "srv_type": "vps",
+            "os_key": "ubuntu24",
+            "runner": "ubuntu-24.04",
+            "access_mode": "all",
+            "username": "cloud",
+            "password": "Cf" + secrets.token_hex(6),
+            "static_port": 32000 + secrets.randbelow(28000),
+            "cycle": 1,
+            "created_at": int(time.time()),
+            "expires_at": int(time.time()) + 260,
+        }
+        upload_enc_json("srv-spec-SELFTEST.enc", test_spec)
+
     spec = None
     for _ in range(8):
         spec = download_enc_json(f"srv-spec-{SERVER_ID}.enc")
@@ -782,6 +800,7 @@ def main() -> int:
     expires_at = int(spec["expires_at"])
     user = spec["username"]
     os_key = spec["os_key"]
+    expected_prev_port = int(spec.get("static_port") or 0)
 
     tools_dir = tempfile.mkdtemp(prefix="cf_tools_")
     bore_bin = install_bore(tools_dir)
@@ -793,6 +812,13 @@ def main() -> int:
         primary_local, sec_ssh_local, web_local = provision_macos(spec, tools_dir)
     else:
         primary_local, sec_ssh_local, web_local = provision_linux(spec, tools_dir)
+
+    if SERVER_ID == "SELFTEST" and cycle == 1:
+        subprocess.run(
+            ["sudo", "-u", user, "tee", f"/home/{user}/persist_proof.txt"],
+            input=b"CLOUDFORGE_PERSIST_OK\n",
+            capture_output=True,
+        )
 
     if cycle > 1:
         log("Restoring persistent workspace from previous cycle...")
@@ -807,7 +833,23 @@ def main() -> int:
 
     primary_tunnel = BoreTunnel(bore_bin, primary_local, int(spec.get("static_port") or 0))
     bound_port = primary_tunnel.start_static(is_renewal=(cycle > 1))
+    print(f"::add-mask::{bound_port}", flush=True)
     spec["static_port"] = bound_port
+
+    if SERVER_ID == "SELFTEST" and cycle == 2:
+        proof_ok = os.path.exists(f"/home/{user}/persist_proof.txt")
+        port_match = (bound_port == expected_prev_port and bound_port > 0)
+        log(f"[SELFTEST] Cycle #2 Verification -> port_match={port_match}, workspace_restored={proof_ok}")
+        primary_tunnel.stop()
+        env = gh_env()
+        for a_name in [
+            "srv-spec-SELFTEST.enc",
+            "srv-status-SELFTEST.enc",
+            "srv-data-SELFTEST.enc",
+            "srv-ready-SELFTEST-c2.enc",
+        ]:
+            subprocess.run(["gh", "release", "delete-asset", NODES_TAG, a_name, "-y", "-R", GH_REPO], env=env, capture_output=True)
+        return 0 if (port_match and proof_ok) else 1
 
     ssh_tunnel: Optional[BoreTunnel] = None
     ssh_remote_port = 0
