@@ -104,18 +104,23 @@ jobs:
 
       - name: Verify Real Desktop Frame Through VNC
         run: |
+          mkdir -p connection-details
+          exec > >(tee -a connection-details/diag.log) 2>&1
+          dscl . -authonly "$CONSOLE_USER" "$MAC_PASSWORD" && echo "Console password OK" || echo "Console password NOT accepted"
+          dscl . -read /Users/$CONSOLE_USER RealName 2>/dev/null || true
           sleep 5
           python3 -m venv /tmp/vncvenv
           /tmp/vncvenv/bin/pip install -q pycryptodome pillow websockify
-          mkdir -p connection-details
-          # Local screenshot (what WindowServer draws)
+          V="perl -e alarm(150);exec(@ARGV) /tmp/vncvenv/bin/python vnc_check.py"
           screencapture -x connection-details/1_local_screen.png || true
-          # Frame over VNC (exactly what RealVNC / noVNC receive), then unlock with the account password
-          perl -e 'alarm 150; exec @ARGV' /tmp/vncvenv/bin/python vnc_check.py "$MAC_PASSWORD" \
-            connection-details/2_vnc_frame.png "$MAC_PASSWORD" connection-details/3_vnc_after_unlock.png \
-            || echo "::warning::VNC frame check did not pass"
+          echo "== A: VNC password viewer (RealVNC / noVNC) =="
+          $V vnc "$MAC_PASSWORD" connection-details/2_vnc_password.png || true
+          echo "== B: Apple ARD viewer as console user =="
+          $V ard "$CONSOLE_USER" "$MAC_PASSWORD" connection-details/3_ard_console_user.png || true
+          echo "== C: VNC password viewer + typing account password at lock screen =="
+          $V vnc "$MAC_PASSWORD" connection-details/4_vnc_before_unlock.png "$MAC_PASSWORD" connection-details/5_vnc_after_unlock.png || true
           sleep 3
-          screencapture -x connection-details/4_local_after.png || true
+          screencapture -x connection-details/6_local_after.png || true
 
       - name: Setup noVNC, Bore & Cloudflare
         run: |
