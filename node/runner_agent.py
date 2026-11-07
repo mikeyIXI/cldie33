@@ -619,8 +619,7 @@ def restore_workspace(user: str) -> None:
                     dst = r"C:\Workspace" if item.lower() == "workspace" else os.path.join(dest_root, item)
                     shutil.copytree(src, dst, dirs_exist_ok=True)
             else:
-                with tarfile.open(tar_p, "r:gz") as tf:
-                    tf.extractall(dest_root)
+                subprocess.run(["sudo", "tar", "-xzf", tar_p, "-C", dest_root], check=False)
                 if IS_LINUX and user != "root":
                     subprocess.run(["sudo", "chown", "-R", f"{user}:{user}", f"/home/{user}"], capture_output=True)
                 elif IS_MAC:
