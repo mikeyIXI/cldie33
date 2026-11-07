@@ -107,11 +107,17 @@ jobs:
           ARCH=$(uname -m)
           if [ "$ARCH" = "arm64" ]; then
             curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-aarch64-apple-darwin.tar.gz | tar -xz
+            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar -xz || true
           else
             curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-apple-darwin.tar.gz | tar -xz
+            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz | tar -xz || true
           fi
           sudo mv bore /usr/local/bin/bore
           chmod +x /usr/local/bin/bore
+          if [ -f cloudflared ]; then
+            sudo mv cloudflared /usr/local/bin/cloudflared
+            chmod +x /usr/local/bin/cloudflared
+          fi
 
           # Setup noVNC (allows running macOS GUI directly in web browser!)
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
@@ -125,20 +131,26 @@ jobs:
           MAC_PASSWORD: ${{ inputs.password || 'Mikey@2026' }}
         run: |
           echo "======================================================"
-          echo " Starting Bore Public Tunnels"
+          echo " Starting Bore Public Tunnels & Cloudflare HTTPS"
           echo "======================================================"
 
           # Tunnel 1: Raw VNC Port 5900 (for RealVNC Viewer, TigerVNC, Remmina, Mac Screen Sharing)
           bore local 5900 --to bore.pub > /tmp/bore_vnc.log 2>&1 &
           
-          # Tunnel 2: Web noVNC Port 6080 (for Browser Access)
+          # Tunnel 2: Cloudflare HTTPS Tunnel for Web noVNC (Enables WebCrypto SSL for Browser)
+          if command -v cloudflared &>/dev/null; then
+            cloudflared tunnel --url http://localhost:6080 --logfile /tmp/cloudflared.log > /dev/null 2>&1 &
+          fi
+
+          # Tunnel 3: Fallback Web noVNC Port 6080 via Bore
           bore local 6080 --to bore.pub > /tmp/bore_web.log 2>&1 &
 
-          # Wait for ports to be assigned
-          for i in {1..30}; do
+          # Wait for ports & HTTPS URL to be assigned
+          for i in {1..35}; do
             VNC_LINE=$(grep -oE "listening at bore.pub:[0-9]+" /tmp/bore_vnc.log || true)
             WEB_LINE=$(grep -oE "listening at bore.pub:[0-9]+" /tmp/bore_web.log || true)
-            if [ -n "$VNC_LINE" ] && [ -n "$WEB_LINE" ]; then
+            CF_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/cloudflared.log 2>/dev/null || true)
+            if [ -n "$VNC_LINE" ] && [ -n "$CF_URL" ]; then
               break
             fi
             sleep 1
@@ -149,18 +161,23 @@ jobs:
 
           echo "VNC_PORT=$VNC_PORT" >> $GITHUB_ENV
           echo "WEB_PORT=$WEB_PORT" >> $GITHUB_ENV
+          echo "CF_URL=$CF_URL" >> $GITHUB_ENV
 
           # Generate connection details file
           mkdir -p connection-details
           cat << 'EOF' > connection-details/CREDENTIALS.md
           # 🍏 Genuine Apple macOS Remote Desktop Access
 
-          ## 🌐 1. Direct Web Browser Access (noVNC - No App Required):
+          ## 🌐 1. Secure Web Browser Access (HTTPS - One-Click):
           Open this link in any browser (Chrome / Safari / Edge / Phone):
           ```
           EOF
 
-          echo "http://bore.pub:${WEB_PORT}/vnc.html?host=bore.pub&port=${WEB_PORT}&autoconnect=true" >> connection-details/CREDENTIALS.md
+          if [ -n "$CF_URL" ]; then
+            echo "${CF_URL}/vnc.html?autoconnect=true" >> connection-details/CREDENTIALS.md
+          else
+            echo "http://bore.pub:${WEB_PORT}/vnc.html?host=bore.pub&port=${WEB_PORT}&autoconnect=true" >> connection-details/CREDENTIALS.md
+          fi
 
           cat << 'EOF' >> connection-details/CREDENTIALS.md
           ```
