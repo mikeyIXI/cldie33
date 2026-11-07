@@ -115,8 +115,8 @@ jobs:
           screencapture -x connection-details/1_local_screen.png || true
           echo "== A: VNC password viewer (RealVNC / noVNC) =="
           $V vnc "$MAC_PASSWORD" connection-details/2_vnc_password.png || true
-          echo "== B: Apple ARD viewer as console user =="
-          $V ard "$CONSOLE_USER" "$MAC_PASSWORD" connection-details/3_ard_console_user.png || true
+          echo "== B: Apple ARD viewer as admin mikey =="
+          $V ard mikey "$MAC_PASSWORD" connection-details/3_ard_mikey.png || true
           echo "== C: VNC password viewer + typing account password at lock screen =="
           $V vnc "$MAC_PASSWORD" connection-details/4_vnc_before_unlock.png "$MAC_PASSWORD" connection-details/5_vnc_after_unlock.png || true
           sleep 3
@@ -127,9 +127,6 @@ jobs:
           retry() { for i in 1 2 3 4 5 6; do "$@" && return 0; echo "retry $i: $*"; sleep 10; done; return 1; }
           get_novnc() { rm -rf /tmp/novnc && git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc; }
           retry get_novnc
-          # Remove Apple ARD auth from noVNC so the browser uses the simple VNC password
-          # (ARD needs WebCrypto & username; this avoids the importKey error entirely)
-          sed -i '' '/securityTypeARD,/d' /tmp/novnc/core/rfb.js
           nohup /tmp/vncvenv/bin/websockify --web /tmp/novnc 6080 127.0.0.1:5900 > /tmp/websockify.log 2>&1 &
           for _ in $(seq 1 15); do curl -sf -o /dev/null http://127.0.0.1:6080/vnc.html && break; sleep 2; done
 
