@@ -104,42 +104,29 @@ jobs:
         run: |
           sleep 5
           python3 -m venv /tmp/vncvenv
-          /tmp/vncvenv/bin/pip install -q vncdotool pillow
+          /tmp/vncvenv/bin/pip install -q pycryptodome pillow websockify
           mkdir -p connection-details
           # Local screenshot (what WindowServer draws)
           screencapture -x connection-details/local_screen.png || true
-          # Frame captured over VNC (exactly what the remote viewer receives)
-          perl -e 'alarm 90; exec @ARGV' /tmp/vncvenv/bin/vncdo -s 127.0.0.1::5900 -p "$MAC_PASSWORD" capture connection-details/vnc_frame.png || true
-          /tmp/vncvenv/bin/python - <<'EOF'
-          from PIL import Image, ImageStat
-          import os
-          for f in ("connection-details/local_screen.png", "connection-details/vnc_frame.png"):
-              if not os.path.exists(f):
-                  print(f, "-> MISSING"); continue
-              im = Image.open(f).convert("L")
-              st = ImageStat.Stat(im)
-              print(f, im.size, "mean brightness=%.1f stddev=%.1f" % (st.mean[0], st.stddev[0]),
-                    "-> BLACK!" if st.stddev[0] < 3 else "-> OK (desktop visible)")
-          EOF
+          /tmp/vncvenv/bin/python -c "from PIL import Image,ImageStat as S; im=Image.open('connection-details/local_screen.png').convert('L'); st=S.Stat(im); print('Local screen', im.size, 'stddev=%.1f' % st.stddev[0])" || true
+          # Frame captured over VNC with password auth (exactly what RealVNC / noVNC receive)
+          perl -e 'alarm 120; exec @ARGV' /tmp/vncvenv/bin/python vnc_check.py "$MAC_PASSWORD" connection-details/vnc_frame.png \
+            && echo "VNC_OK=1" >> "$GITHUB_ENV" || echo "::warning::VNC frame check did not pass"
 
       - name: Setup noVNC, Bore & Cloudflare
         run: |
-          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+          retry() { for i in 1 2 3 4 5 6; do "$@" && return 0; echo "retry $i: $*"; sleep 10; done; return 1; }
+          get_novnc() { rm -rf /tmp/novnc && git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc; }
+          retry get_novnc
           # Remove Apple ARD auth from noVNC so the browser uses the simple VNC password
           # (ARD needs WebCrypto & username; this avoids the importKey error entirely)
           sed -i '' '/securityTypeARD,/d' /tmp/novnc/core/rfb.js
-          /tmp/vncvenv/bin/pip install -q websockify
           nohup /tmp/vncvenv/bin/websockify --web /tmp/novnc 6080 127.0.0.1:5900 > /tmp/websockify.log 2>&1 &
           for _ in $(seq 1 15); do curl -sf -o /dev/null http://127.0.0.1:6080/vnc.html && break; sleep 2; done
 
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "arm64" ]; then
-            curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-aarch64-apple-darwin.tar.gz | tar -xz
-            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar -xz
-          else
-            curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-apple-darwin.tar.gz | tar -xz
-            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz | tar -xz
-          fi
+          if [ "$(uname -m)" = "arm64" ]; then B=aarch64; C=arm64; else B=x86_64; C=amd64; fi
+          retry sh -c "curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-${B}-apple-darwin.tar.gz | tar -xz"
+          retry sh -c "curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${C}.tgz | tar -xz"
           sudo mv bore cloudflared /usr/local/bin/
           sudo chmod +x /usr/local/bin/bore /usr/local/bin/cloudflared
 
@@ -172,6 +159,7 @@ jobs:
           cat connection-details/CREDENTIALS.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Connection Details & Screenshots
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: macos-connection-info
