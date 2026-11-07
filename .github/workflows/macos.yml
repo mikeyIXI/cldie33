@@ -1,10 +1,10 @@
-name: macOS Sonoma Edition (Linux XRDP + Bore)
+name: macOS Genuine Edition (Screen Sharing + Bore)
 
 on:
   workflow_dispatch:
     inputs:
       password:
-        description: 'Password for RDP (default: Mikey@2026)'
+        description: 'Password for macOS login & VNC (default: Mikey@2026)'
         required: false
         default: 'Mikey@2026'
       auto_restart:
@@ -14,609 +14,222 @@ on:
         default: false
 
 concurrency:
-  group: vexor-macos-linux
+  group: vexor-macos-native
   cancel-in-progress: true
 
 jobs:
   macos-desktop:
-    name: Run macOS Sonoma Desktop
-    runs-on: ubuntu-22.04
+    name: Run Genuine macOS Desktop
+    runs-on: macos-13
     timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup 32 GB Swap Memory
+      - name: System Diagnostics & Information
         run: |
-          echo "[*] Creating 32 GB Swap file for maximum memory capacity..."
-          sudo swapoff -a || true
-          sudo rm -f /swapfile || true
-          sudo fallocate -l 32G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=32768
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
+          echo "======================================================"
+          echo " macOS Runner System Information"
+          echo "======================================================"
+          sw_vers
+          uname -a
+          sysctl machdep.cpu.brand_string || true
+          sysctl hw.memsize || true
 
-      - name: Setup macOS Desktop Environment & XRDP
+      - name: Activate Native Virtual Display (Fix Black Screen)
+        run: |
+          echo "======================================================"
+          echo " Compiling & Activating CGVirtualDisplay Daemon"
+          echo "======================================================"
+          # Compile native Objective-C daemon that attaches an active 1920x1080 display
+          # to WindowServer so macOS allocates a real framebuffer and stops black screen
+          clang -fobjc-arc -framework Cocoa -framework CoreGraphics virtual_display.m -o virtual_display
+          chmod +x virtual_display
+          ./virtual_display > /tmp/virtual_display.log 2>&1 &
+          sleep 3
+
+          # Apply VMware tools resolution if available
+          if [ -f "/Library/Application Support/VMware Tools/vmware-resolutionSet" ]; then
+            echo "[*] Setting VMware display resolution to 1920x1080..."
+            "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 || true
+          fi
+
+          # Disable screen/system sleep and wake display
+          echo "[*] Configuring power management to prevent sleep..."
+          sudo pmset -a displaysleep 0 disksleep 0 sleep 0 2>/dev/null || true
+          caffeinate -d -i -m -u &
+          cat /tmp/virtual_display.log || true
+
+      - name: Configure macOS Screen Sharing & Authentication
         env:
-          RDP_PASSWORD: ${{ inputs.password || 'Mikey@2026' }}
+          MAC_PASSWORD: ${{ inputs.password || 'Mikey@2026' }}
         run: |
+          echo "======================================================"
+          echo " Configuring macOS Users & Screen Sharing (ARDAgent)"
+          echo "======================================================"
           set -e
-          echo "======================================================"
-          echo " Installing macOS Sonoma Environment (WhiteSur + Plank) + XRDP"
-          echo "======================================================"
 
-          export DEBIAN_FRONTEND=noninteractive
+          # Set password for runner and root
+          echo "[*] Updating runner and root passwords..."
+          sudo dscl . -passwd /Users/runner "$MAC_PASSWORD"
+          sudo dscl . -passwd /Users/root "$MAC_PASSWORD"
 
-          # Disable any conflicting remote desktop services
-          sudo systemctl stop gnome-remote-desktop 2>/dev/null || true
-          sudo systemctl disable gnome-remote-desktop 2>/dev/null || true
-          sudo systemctl mask gnome-remote-desktop 2>/dev/null || true
+          # Configure auto-login for user runner
+          echo "[*] Configuring auto-login for runner..."
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser runner
 
-          # Update apt
-          sudo apt-get update -y
+          # Generate legacy VNC password hash for compatibility with standard VNC clients
+          echo "[*] Generating VNC legacy password..."
+          echo -n "$MAC_PASSWORD" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
+          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
 
-          # Install XRDP, TigerVNC, XFCE4, Plank dock, build tools, fonts and utilities
-          sudo apt-get install -y --no-install-recommends \
-            xrdp \
-            xorgxrdp \
-            tigervnc-standalone-server \
-            tigervnc-common \
-            xserver-xorg-core \
-            xserver-xorg-video-dummy \
-            xfce4 \
-            xfce4-goodies \
-            xfce4-terminal \
-            xfce4-whiskermenu-plugin \
-            xfce4-pulseaudio-plugin \
-            pavucontrol \
-            plank \
-            sassc \
-            libglib2.0-dev-bin \
-            libxml2-utils \
-            dbus-x11 \
-            x11-xserver-utils \
-            fonts-cantarell \
-            fonts-ubuntu \
-            firefox \
-            curl \
-            wget \
-            git \
-            jq \
-            unzip \
-            tar \
-            htop \
-            nano
+          # Configure Apple Remote Management / Screen Sharing via kickstart
+          echo "[*] Activating Apple Remote Desktop Agent..."
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate \
+            -configure -allowAccessFor -allUsers -privs -all \
+            -configure -clientopts -setvnclegacy -vnclegacy yes \
+            -configure -clientopts -setmenuextra -menuextra yes \
+            -restart -agent -console
 
-          # Download and install bore tunnel client
-          curl -sL https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz | sudo tar -xz -C /usr/local/bin bore
-          sudo chmod +x /usr/local/bin/bore
+          # Verify VNC listening on port 5900
+          sleep 2
+          netstat -an | grep 5900 || true
 
-          # Install Apple San Francisco Pro Fonts
-          echo "[*] Installing Apple San Francisco Pro fonts..."
-          sudo mkdir -p /usr/local/share/fonts/SFPro
-          sudo curl -sL "https://raw.githubusercontent.com/sahibjotsaggu/San-Francisco-Pro-Fonts/master/SF-Pro-Display-Regular.otf" -o /usr/local/share/fonts/SFPro/SF-Pro-Display-Regular.otf || true
-          sudo curl -sL "https://raw.githubusercontent.com/sahibjotsaggu/San-Francisco-Pro-Fonts/master/SF-Pro-Display-Bold.otf" -o /usr/local/share/fonts/SFPro/SF-Pro-Display-Bold.otf || true
-          sudo curl -sL "https://raw.githubusercontent.com/sahibjotsaggu/San-Francisco-Pro-Fonts/master/SF-Pro-Display-Medium.otf" -o /usr/local/share/fonts/SFPro/SF-Pro-Display-Medium.otf || true
-          sudo fc-cache -f -v /usr/local/share/fonts/SFPro || true
-
-          # Install WhiteSur GTK Theme (macOS Big Sur / Sonoma design for GTK desktops)
-          echo "[*] Installing WhiteSur GTK theme..."
-          git clone --depth 1 https://github.com/vinceliuice/WhiteSur-gtk-theme.git /tmp/whitesur-gtk || true
-          if [ -d "/tmp/whitesur-gtk" ]; then
-            cd /tmp/whitesur-gtk
-            ./install.sh -d /usr/share/themes -t all -s standard -a all -m || true
-            cd -
-          fi
-
-          # Install WhiteSur Icon Theme (macOS icons: Finder, Launchpad, Safari, App Store, Settings)
-          echo "[*] Installing WhiteSur icon theme..."
-          git clone --depth 1 https://github.com/vinceliuice/WhiteSur-icon-theme.git /tmp/whitesur-icons || true
-          if [ -d "/tmp/whitesur-icons" ]; then
-            cd /tmp/whitesur-icons
-            ./install.sh -d /usr/share/icons -a || true
-            cd -
-            sudo gtk-update-icon-cache /usr/share/icons/WhiteSur || true
-            sudo gtk-update-icon-cache /usr/share/icons/WhiteSur-dark || true
-          fi
-
-          # Extract official Apple logo icon for the Top Panel Whisker Menu
-          sudo mkdir -p /usr/share/pixmaps
-          if [ -f "/tmp/whitesur-gtk/src/assets/gnome-shell/activities/activities-apple.svg" ]; then
-            sudo cp /tmp/whitesur-gtk/src/assets/gnome-shell/activities/activities-apple.svg /usr/share/pixmaps/apple-logo.svg
-            sudo cp /tmp/whitesur-gtk/src/assets/gnome-shell/activities/activities-apple.svg /usr/share/pixmaps/apple.svg
-          fi
-
-          # Install WhiteSur Plank Theme for macOS floating dock
-          echo "[*] Setting up WhiteSur Plank Dock theme..."
-          sudo mkdir -p /usr/share/plank/themes/WhiteSur-Dark
-          if [ -d "/tmp/whitesur-gtk/other/plank/theme-Dark" ]; then
-            sudo cp -r /tmp/whitesur-gtk/other/plank/theme-Dark/* /usr/share/plank/themes/WhiteSur-Dark/
-          fi
-
-          # Download official macOS Sonoma and Monterey 4K Wallpapers
-          echo "[*] Downloading official macOS Sonoma wallpapers..."
-          sudo mkdir -p /usr/share/backgrounds/macos /usr/share/backgrounds/xfce
-          sudo curl -sL "https://raw.githubusercontent.com/vinceliuice/WhiteSur-wallpapers/main/4k/Sonoma-dark.jpg" -o /usr/share/backgrounds/macos/sonoma-dark.jpg
-          sudo curl -sL "https://raw.githubusercontent.com/vinceliuice/WhiteSur-wallpapers/main/4k/Monterey-dark.jpg" -o /usr/share/backgrounds/macos/monterey-dark.jpg
-          
-          # Overwrite default XFCE wallpapers so any default display displays Sonoma
-          sudo cp /usr/share/backgrounds/macos/sonoma-dark.jpg /usr/share/backgrounds/xfce/xfce-teal.jpg || true
-          sudo cp /usr/share/backgrounds/macos/sonoma-dark.jpg /usr/share/backgrounds/xfce/xfce-blue.jpg || true
-          sudo cp /usr/share/backgrounds/macos/sonoma-dark.jpg /usr/share/backgrounds/xfce/xfce-stripes.png || true
-
-          # Setup users: 'mikey' and 'runner'
-          echo "[*] Setting up users..."
-          if ! id "mikey" &>/dev/null; then
-            sudo useradd -m -s /bin/bash -G sudo,adm,audio,video mikey
-          fi
-          echo "mikey:$RDP_PASSWORD" | sudo chpasswd
-          echo "runner:$RDP_PASSWORD" | sudo chpasswd
-
-          # Sudoers without password
-          echo "mikey ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/mikey
-          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner
-
-          # Fix XRDP permissions
-          sudo adduser xrdp ssl-cert || true
-          sudo adduser mikey ssl-cert || true
-          sudo adduser runner ssl-cert || true
-
-          # Configure polkit to suppress authentication popups inside RDP session
-          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d/
-          sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla << 'EOF'
-          [Allow Colord all Users]
-          Identity=unix-user:*
-          Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
-          ResultAny=no
-          ResultInactive=no
-          ResultActive=yes
-
-          [Allow PackageKit all Users]
-          Identity=unix-user:*
-          Action=org.freedesktop.packagekit.system-sources-refresh;org.freedesktop.packagekit.system-network-proxy-configure
-          ResultAny=no
-          ResultInactive=no
-          ResultActive=yes
-          EOF
-
-          # Configure ~/.xsession: Launch Plank dock and dynamic wallpaper setter
-          for u in mikey runner; do
-            UHOME="/home/$u"
-            cat << 'XSES' | sudo tee "$UHOME/.xsession"
-          #!/bin/bash
-          # Dynamic wallpaper setter on session start
-          (
-            sleep 2
-            for prop in $(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep -E "last-image|image-path"); do
-              xfconf-query -c xfce4-desktop -p "$prop" -s /usr/share/backgrounds/macos/sonoma-dark.jpg 2>/dev/null || true
-            done
-            xfdesktop --reload 2>/dev/null || true
-          ) &
-
-          # Start macOS Plank Dock
-          (sleep 2 && plank) &
-
-          exec xfce4-session
-          XSES
-            sudo chmod 755 "$UHOME"
-            sudo chmod +x "$UHOME/.xsession"
-            sudo chown -R $u:$u "$UHOME"
-          done
-
-          # Configure /etc/xrdp/startwm.sh
-          cat << 'EOF' | sed 's/^[ \t]*//' | sudo tee /etc/xrdp/startwm.sh
-          #!/bin/sh
-          if [ -r /etc/default/locale ]; then
-            . /etc/default/locale
-            export LANG LANGUAGE
-          fi
-
-          unset DBUS_SESSION_BUS_ADDRESS
-          unset XDG_RUNTIME_DIR
-
-          test -x /etc/X11/Xsession && exec /etc/X11/Xsession
-          exec /bin/sh /etc/X11/Xsession
-          EOF
-          sudo chmod +x /etc/xrdp/startwm.sh
-
-          # Allow anybody to start Xorg
-          echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config
-          sudo chmod 644 /etc/X11/Xwrapper.config
-
-          # Configure xrdp.ini: prioritize Xvnc for reliable virtual display
-          sudo python3 -c "
-          with open('/etc/xrdp/xrdp.ini', 'r') as f:
-              content = f.read()
-          if '[Xvnc]' in content and '[Xorg]' in content:
-              parts = content.split('[Xorg]')
-              pre_xorg = parts[0]
-              post_xorg = '[Xorg]' + parts[1]
-              vnc_parts = post_xorg.split('[Xvnc]')
-              vnc_section = '[Xvnc]' + vnc_parts[1].split('\n\n[')[0]
-              rest_after_vnc = post_xorg.replace(vnc_section, '')
-              new_content = pre_xorg + vnc_section + '\n\n' + rest_after_vnc
-              with open('/etc/xrdp/xrdp.ini', 'w') as f:
-                  f.write(new_content)
-          "
-
-          sudo sed -i 's/port=3389/port=3389/g' /etc/xrdp/xrdp.ini
-          sudo sed -i 's/max_bpp=32/max_bpp=24/g' /etc/xrdp/xrdp.ini
-          sudo sed -i 's/crypt_level=high/crypt_level=low/g' /etc/xrdp/xrdp.ini
-
-          # Pre-configure macOS Top Menu Bar in /etc/skel
-          sudo mkdir -p /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml
-          sudo mkdir -p /etc/skel/.config/xfce4/panel
-          sudo mkdir -p /etc/skel/.config/plank/dock1/launchers
-          sudo mkdir -p /etc/xdg/xfce4/xfconf/xfce-perchannel-xml
-
-          # 1. Top Panel (Apple Logo Menu, Separator, Systray, Sound, Clock, Control Center)
-          cat << 'PANELXML' | sudo tee /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfce4-panel" version="1.0">
-            <property name="configver" type="int" value="2"/>
-            <property name="panels" type="array">
-              <value type="int" value="1"/>
-              <property name="panel-1" type="empty">
-                <property name="position" type="string" value="p=6;x=0;y=0"/>
-                <property name="length" type="uint" value="100"/>
-                <property name="position-locked" type="bool" value="true"/>
-                <property name="size" type="uint" value="28"/>
-                <property name="plugin-ids" type="array">
-                  <value type="int" value="1"/>
-                  <value type="int" value="2"/>
-                  <value type="int" value="3"/>
-                  <value type="int" value="4"/>
-                  <value type="int" value="5"/>
-                  <value type="int" value="6"/>
-                </property>
-                <property name="background-style" type="uint" value="0"/>
-                <property name="length-adjust" type="bool" value="true"/>
-                <property name="span-monitors" type="bool" value="false"/>
-                <property name="mode" type="uint" value="0"/>
-                <property name="autohide-behavior" type="uint" value="0"/>
-                <property name="disable-struts" type="bool" value="false"/>
-              </property>
-            </property>
-            <property name="plugins" type="empty">
-              <property name="plugin-1" type="string" value="whiskermenu">
-                <property name="button-icon" type="string" value="/usr/share/pixmaps/apple-logo.svg"/>
-                <property name="show-button-title" type="bool" value="false"/>
-                <property name="show-button-icon" type="bool" value="true"/>
-              </property>
-              <property name="plugin-2" type="string" value="separator">
-                <property name="style" type="uint" value="0"/>
-                <property name="expand" type="bool" value="true"/>
-              </property>
-              <property name="plugin-3" type="string" value="systray">
-                <property name="show-frame" type="bool" value="false"/>
-                <property name="size-max" type="uint" value="20"/>
-                <property name="square-icons" type="bool" value="true"/>
-              </property>
-              <property name="plugin-4" type="string" value="pulseaudio">
-                <property name="enable-keyboard-shortcuts" type="bool" value="true"/>
-              </property>
-              <property name="plugin-5" type="string" value="clock">
-                <property name="digital-layout" type="uint" value="3"/>
-                <property name="digital-time-format" type="string" value="%a %b %e  %l:%M %p"/>
-                <property name="mode" type="uint" value="2"/>
-              </property>
-              <property name="plugin-6" type="string" value="actions">
-                <property name="appearance" type="uint" value="0"/>
-                <property name="items" type="array">
-                  <value type="string" value="-lock-screen"/>
-                  <value type="string" value="-switch-user"/>
-                  <value type="string" value="+separator"/>
-                  <value type="string" value="-restart"/>
-                  <value type="string" value="+shutdown"/>
-                  <value type="string" value="-separator"/>
-                  <value type="string" value="-logout"/>
-                </property>
-              </property>
-            </property>
-          </channel>
-          PANELXML
-
-          # 2. Apple Menu (Whisker Menu) Config
-          cat << 'WHISKER' | sudo tee /etc/skel/.config/xfce4/panel/whiskermenu-1.rc
-          favorites=thunar.desktop,xfce4-appfinder.desktop,firefox.desktop,xfce4-terminal.desktop,xfce4-settings-manager.desktop
-          recent=
-          button-title=
-          button-icon=/usr/share/pixmaps/apple-logo.svg
-          button-single-row=false
-          show-button-title=false
-          show-button-icon=true
-          launcher-show-name=true
-          launcher-show-description=true
-          launcher-show-tooltip=true
-          item-icon-size=2
-          hover-switch-category=false
-          category-icon-size=1
-          load-hierarchy=false
-          recent-items-max=10
-          favorites-in-recent=true
-          display-recent-default=false
-          position-search-alternate=false
-          position-commands-alternate=false
-          position-categories-alternate=false
-          menu-width=430
-          menu-height=560
-          menu-opacity=95
-          command-settings=xfce4-settings-manager
-          show-command-settings=true
-          command-lockscreen=xflock4
-          show-command-lockscreen=true
-          command-switchuser=gdmflexiserver
-          show-command-switchuser=true
-          command-logout=xfce4-session-logout
-          show-command-logout=true
-          WHISKER
-
-          # 3. macOS Sonoma Desktop Wallpaper XML
-          cat << 'DESKXML' | sudo tee /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfce4-desktop" version="1.0">
-            <property name="backdrop" type="empty">
-              <property name="screen0" type="empty">
-                <property name="monitor0" type="empty">
-                  <property name="image-path" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="workspace0" type="empty">
-                    <property name="color-style" type="int" value="0"/>
-                    <property name="image-style" type="int" value="5"/>
-                    <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  </property>
-                </property>
-                <property name="monitorVirtual1" type="empty">
-                  <property name="image-path" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="workspace0" type="empty">
-                    <property name="color-style" type="int" value="0"/>
-                    <property name="image-style" type="int" value="5"/>
-                    <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  </property>
-                </property>
-                <property name="monitorVNC-0" type="empty">
-                  <property name="image-path" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="workspace0" type="empty">
-                    <property name="color-style" type="int" value="0"/>
-                    <property name="image-style" type="int" value="5"/>
-                    <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  </property>
-                </property>
-                <property name="monitorscreen" type="empty">
-                  <property name="image-path" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="workspace0" type="empty">
-                    <property name="color-style" type="int" value="0"/>
-                    <property name="image-style" type="int" value="5"/>
-                    <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  </property>
-                </property>
-                <property name="monitorrdp0" type="empty">
-                  <property name="image-path" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  <property name="workspace0" type="empty">
-                    <property name="color-style" type="int" value="0"/>
-                    <property name="image-style" type="int" value="5"/>
-                    <property name="last-image" type="string" value="/usr/share/backgrounds/macos/sonoma-dark.jpg"/>
-                  </property>
-                </property>
-              </property>
-            </property>
-          </channel>
-          DESKXML
-
-          # 4. WhiteSur Theme and San Francisco Font Settings
-          cat << 'XSET' | sudo tee /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xsettings" version="1.0">
-            <property name="Net" type="empty">
-              <property name="ThemeName" type="string" value="WhiteSur-Dark"/>
-              <property name="IconThemeName" type="string" value="WhiteSur-dark"/>
-              <property name="CursorThemeName" type="string" value="DMZ-White"/>
-              <property name="EnableEventSounds" type="bool" value="false"/>
-              <property name="EnableInputFeedbackSounds" type="bool" value="false"/>
-            </property>
-            <property name="Gtk" type="empty">
-              <property name="FontName" type="string" value="SF Pro Display 10"/>
-              <property name="MonospaceFontName" type="string" value="Monospace 10"/>
-              <property name="CursorThemeName" type="string" value="DMZ-White"/>
-              <property name="CursorThemeSize" type="int" value="24"/>
-              <property name="DecorationLayout" type="string" value="close,minimize,maximize:"/>
-            </property>
-          </channel>
-          XSET
-
-          # 5. Window Manager Traffic Lights on Top-Left + Centered Titles + Compositing
-          cat << 'XFWM' | sudo tee /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfwm4" version="1.0">
-            <property name="general" type="empty">
-              <property name="theme" type="string" value="WhiteSur-Dark"/>
-              <property name="title_font" type="string" value="SF Pro Display Bold 10"/>
-              <property name="button_layout" type="string" value="CHM|"/>
-              <property name="title_alignment" type="string" value="center"/>
-              <property name="box_move" type="bool" value="false"/>
-              <property name="box_resize" type="bool" value="false"/>
-              <property name="use_compositing" type="bool" value="true"/>
-              <property name="show_dock_shadow" type="bool" value="true"/>
-              <property name="show_frame_shadow" type="bool" value="true"/>
-            </property>
-          </channel>
-          XFWM
-
-          # 6. Plank macOS Dock Preferences
-          cat << 'PLANKCONF' | sudo tee /etc/skel/.config/plank/dock1/settings
-          [PlankDockPreferences]
-          Alignment=3
-          AutoPinning=true
-          CurrentWorkspaceOnly=false
-          DockItems=01-finder.dockitem;;02-launchpad.dockitem;;03-safari.dockitem;;04-terminal.dockitem;;05-settings.dockitem
-          HideDelay=0
-          HideMode=0
-          IconSize=50
-          ItemMoveTime=450
-          LockItems=false
-          Monitor=
-          Offset=0
-          PinnedOnly=false
-          Position=3
-          PressureReveal=false
-          ShowDockItem=false
-          Theme=WhiteSur-Dark
-          UnhideDelay=0
-          ZoomEnabled=true
-          ZoomPercent=135
-          PLANKCONF
-
-          # 7. Plank Pinned Launchers (Finder, Launchpad, Safari/Browser, Terminal, System Settings)
-          echo -e "[PlankDockItemPreferences]\nLauncher=file:///usr/share/applications/thunar.desktop" | sudo tee /etc/skel/.config/plank/dock1/launchers/01-finder.dockitem
-          echo -e "[PlankDockItemPreferences]\nLauncher=file:///usr/share/applications/xfce4-appfinder.desktop" | sudo tee /etc/skel/.config/plank/dock1/launchers/02-launchpad.dockitem
-          echo -e "[PlankDockItemPreferences]\nLauncher=file:///usr/share/applications/firefox.desktop" | sudo tee /etc/skel/.config/plank/dock1/launchers/03-safari.dockitem
-          echo -e "[PlankDockItemPreferences]\nLauncher=file:///usr/share/applications/xfce4-terminal.desktop" | sudo tee /etc/skel/.config/plank/dock1/launchers/04-terminal.dockitem
-          echo -e "[PlankDockItemPreferences]\nLauncher=file:///usr/share/applications/xfce4-settings-manager.desktop" | sudo tee /etc/skel/.config/plank/dock1/launchers/05-settings.dockitem
-
-          # Copy system-wide defaults to /etc/xdg
-          sudo cp -r /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/* /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ 2>/dev/null || true
-
-          # Apply all configs to 'mikey' and 'runner'
-          for u in mikey runner; do
-            UHOME="/home/$u"
-            sudo mkdir -p "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml"
-            sudo mkdir -p "$UHOME/.config/xfce4/panel"
-            sudo mkdir -p "$UHOME/.config/plank/dock1/launchers"
-            sudo cp -r /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/* "$UHOME/.config/xfce4/xfconf/xfce-perchannel-xml/"
-            sudo cp /etc/skel/.config/xfce4/panel/whiskermenu-1.rc "$UHOME/.config/xfce4/panel/"
-            sudo cp -r /etc/skel/.config/plank "$UHOME/.config/"
-            sudo chown -R $u:$u "$UHOME"
-          done
-
-          # Restart XRDP services
-          sudo systemctl daemon-reload
-          sudo systemctl restart xrdp-sesman xrdp
-          sudo systemctl enable xrdp xrdp-sesman
-
-          echo "[*] XRDP service started and listening on port 3389."
-
-      - name: Start Bore Tunnel & Expose RDP
-        id: tunnel
+      - name: Setup Bore Tunnel & Web noVNC Proxy
         run: |
-          echo "[*] Starting Bore reverse tunnel on port 3389..."
+          echo "======================================================"
+          echo " Installing Bore Tunnel & noVNC Web Gateway"
+          echo "======================================================"
           
-          cat << 'EOF' > /tmp/run_bore.sh
-          #!/bin/bash
-          while true; do
-            bore local 3389 --to bore.pub >> /tmp/bore.log 2>&1
-            sleep 2
-          done
-          EOF
-          chmod +x /tmp/run_bore.sh
-          nohup /tmp/run_bore.sh > /dev/null 2>&1 &
-
-          TUNNEL=""
-          for i in {1..25}; do
-            sleep 2
-            if [ -f /tmp/bore.log ]; then
-              PORT=$(grep -oE "listening at bore\.pub:[0-9]+" /tmp/bore.log | tail -n1 | cut -d':' -f2)
-              if [ -n "$PORT" ]; then
-                TUNNEL="bore.pub:$PORT"
-                echo "Found bore tunnel: $TUNNEL"
-                break
-              fi
-            fi
-            echo "Waiting for bore tunnel (attempt $i/25)..."
-          done
-
-          if [ -z "$TUNNEL" ]; then
-            echo "[!] Failed to get bore tunnel. Bore log:"
-            cat /tmp/bore.log || true
-            exit 1
+          # Install Bore CLI
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-aarch64-apple-darwin.tar.gz | tar -xz
+          else
+            curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-apple-darwin.tar.gz | tar -xz
           fi
+          sudo mv bore /usr/local/bin/bore
+          chmod +x /usr/local/bin/bore
 
-          echo "TUNNEL_ADDRESS=$TUNNEL" >> $GITHUB_ENV
-          echo "tunnel=$TUNNEL" >> $GITHUB_OUTPUT
+          # Setup noVNC (allows running macOS GUI directly in web browser!)
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+          git clone --depth 1 https://github.com/novnc/websockify /tmp/novnc/utils/websockify
+          /tmp/novnc/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > /tmp/novnc.log 2>&1 &
+          sleep 3
 
-          cat << EOF >> $GITHUB_STEP_SUMMARY
-          # 🍎 macOS Sonoma Cloud RDP Ready!
+      - name: Launch Bore Tunnels & Generate Credentials
+        id: tunnels
+        env:
+          MAC_PASSWORD: ${{ inputs.password || 'Mikey@2026' }}
+        run: |
+          echo "======================================================"
+          echo " Starting Bore Public Tunnels"
+          echo "======================================================"
 
-          | Item | Value |
-          |---|---|
-          | **OS Style** | macOS Sonoma / MacBook Edition (Linux) |
-          | **Total Memory** | 39 GB (7 GB RAM + 32 GB Swap) |
-          | **RDP Address** | \`$TUNNEL\` |
-          | **Primary Username** | \`mikey\` |
-          | **Fallback Username** | \`runner\` |
-          | **Password** | \`${{ inputs.password || 'Mikey@2026' }}\` |
-          | **Client App** | Windows Remote Desktop (\`mstsc.exe\`) |
+          # Tunnel 1: Raw VNC Port 5900 (for RealVNC Viewer, TigerVNC, Remmina, Mac Screen Sharing)
+          bore local 5900 --to bore.pub > /tmp/bore_vnc.log 2>&1 &
+          
+          # Tunnel 2: Web noVNC Port 6080 (for Browser Access)
+          bore local 6080 --to bore.pub > /tmp/bore_web.log 2>&1 &
 
-          ### 📌 How to Connect:
-          1. Press **Win + R**, type **\`mstsc\`**, and press Enter.
-          2. In the Computer field, enter: **\`$TUNNEL\`**
-          3. Click **Connect**.
-          4. When prompted, enter Username: **\`mikey\`** and Password: **\`${{ inputs.password || 'Mikey@2026' }}\`**
-          5. Enjoy your macOS MacBook desktop experience!
+          # Wait for ports to be assigned
+          for i in {1..30}; do
+            VNC_LINE=$(grep -oE "listening at bore.pub:[0-9]+" /tmp/bore_vnc.log || true)
+            WEB_LINE=$(grep -oE "listening at bore.pub:[0-9]+" /tmp/bore_web.log || true)
+            if [ -n "$VNC_LINE" ] && [ -n "$WEB_LINE" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          VNC_PORT=$(echo "$VNC_LINE" | cut -d: -f2)
+          WEB_PORT=$(echo "$WEB_LINE" | cut -d: -f2)
+
+          echo "VNC_PORT=$VNC_PORT" >> $GITHUB_ENV
+          echo "WEB_PORT=$WEB_PORT" >> $GITHUB_ENV
+
+          # Generate connection details file
+          mkdir -p connection-details
+          cat << 'EOF' > connection-details/CREDENTIALS.md
+          # 🍏 Genuine Apple macOS Remote Desktop Access
+
+          ## 🌐 1. Direct Web Browser Access (noVNC - No App Required):
+          Open this link in any browser (Chrome / Safari / Edge / Phone):
+          ```
           EOF
 
-          mkdir -p ./rdp_info
-          cat << EOF > ./rdp_info/connection.txt
-          MACOS SONOMA CLOUD RDP CONNECTION DETAILS
-          =======================================
-          RDP Host/Address: $TUNNEL
-          Username:         mikey
-          Alternative User: runner
-          Password:         ${{ inputs.password || 'Mikey@2026' }}
-          Memory:           39 GB (7 GB RAM + 32 GB Swap)
-          Protocol:         RDP (Standard Remote Desktop)
-          Client:           mstsc.exe (Windows Remote Desktop Connection)
-          =======================================
+          echo "http://bore.pub:${WEB_PORT}/vnc.html?host=bore.pub&port=${WEB_PORT}&autoconnect=true" >> connection-details/CREDENTIALS.md
+
+          cat << 'EOF' >> connection-details/CREDENTIALS.md
+          ```
+          - Password: `${MAC_PASSWORD}`
+
+          ---
+
+          ## 💻 2. VNC Client Access (RealVNC Viewer / TigerVNC / Remmina):
+          ```
           EOF
 
-          echo "============================================"
-          echo " [+] RDP IS LIVE AT: $TUNNEL"
-          echo " [+] User          : mikey"
-          echo " [+] Password      : ${{ inputs.password || 'Mikey@2026' }}"
-          echo "============================================"
+          echo "Host / Address : bore.pub:${VNC_PORT}" >> connection-details/CREDENTIALS.md
+          echo "Username       : runner" >> connection-details/CREDENTIALS.md
+          echo "Password       : ${MAC_PASSWORD}" >> connection-details/CREDENTIALS.md
+
+          cat << 'EOF' >> connection-details/CREDENTIALS.md
+          ```
+
+          > [!NOTE]
+          > - **Recommended client:** **RealVNC Viewer** (Free for Windows, Android, iOS, Linux, Mac).
+          > - In RealVNC Viewer: set Encryption to **"Let VNC Server Choose"** or **"Prefer Off"** if asked.
+          > - You can also open the Web Link directly on your phone or PC!
+          EOF
+
+          # Display in logs
+          echo "=========================================================="
+          echo " macOS REMOTE DESKTOP READY!"
+          echo "=========================================================="
+          cat connection-details/CREDENTIALS.md
+          echo "=========================================================="
 
       - name: Upload Connection Details Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macOS-RDP-Details
-          path: ./rdp_info/connection.txt
+          name: macos-connection-info
+          path: connection-details/
+          retention-days: 1
 
-      - name: Keep-Alive Loop (Up to 6 Hours)
+      - name: Keep macOS Session Alive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTO_RESTART: ${{ inputs.auto_restart }}
         run: |
-          echo "[*] Server is now running. Press Ctrl+C or cancel workflow to stop."
+          echo "======================================================"
+          echo " macOS Session is active. Monitoring tunnels..."
+          echo "======================================================"
+
           START_TIME=$(date +%s)
-          MAX_SECONDS=$(( 345 * 60 ))
+          MAX_DURATION=$(( 350 * 60 )) # 350 minutes (~5.8 hours)
 
           while true; do
-            CURRENT_TIME=$(date +%s)
-            ELAPSED=$(( CURRENT_TIME - START_TIME ))
-            REMAINING=$(( MAX_SECONDS - ELAPSED ))
-            
-            if [ $REMAINING -le 0 ]; then
-              echo "[*] Max execution time reached. Exiting."
+            NOW=$(date +%s)
+            ELAPSED=$(( NOW - START_TIME ))
+
+            if [ $ELAPSED -ge $MAX_DURATION ]; then
+              echo "[!] Approaching 6-hour GitHub Actions execution limit."
+              if [ "$AUTO_RESTART" = "true" ]; then
+                echo "[*] Triggering automated continuation workflow..."
+                gh workflow run macos.yml --ref main || true
+              fi
               break
             fi
 
-            MINS_LEFT=$(( REMAINING / 60 ))
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] macOS RDP Active: $TUNNEL_ADDRESS | Time remaining: ${MINS_LEFT} minutes"
-            
-            if ! systemctl is-active --quiet xrdp; then
-              echo "[!] Warning: XRDP not active, restarting..."
-              sudo systemctl restart xrdp || true
+            # Check if tunnels are alive
+            if ! pgrep -f "bore local" > /dev/null; then
+              echo "[!] Bore tunnel exited, restarting..."
+              bore local 5900 --to bore.pub >> /tmp/bore_vnc.log 2>&1 &
+              bore local 6080 --to bore.pub >> /tmp/bore_web.log 2>&1 &
             fi
 
             sleep 60
           done
-
-      - name: Auto-Restart Workflow
-        if: ${{ inputs.auto_restart == true && !cancelled() }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "[*] Triggering automatic restart of macOS workflow..."
-          gh workflow run macos.yml -f password="${{ inputs.password || 'Mikey@2026' }}" -f auto_restart=true || true
