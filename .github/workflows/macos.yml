@@ -199,36 +199,52 @@ jobs:
           done
           sudo killall tccd 2>/dev/null || true
 
-          # Permanent password + quality-first options, written before first start
-          CFG="/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk"
-          sudo -u "$CONSOLE_USER" mkdir -p "$CFG"
-          printf "password = '%s'\n" "$MAC_PASSWORD" | sudo -u "$CONSOLE_USER" tee "$CFG/RustDesk.toml" >/dev/null
-          sudo -u "$CONSOLE_USER" tee "$CFG/RustDesk2.toml" >/dev/null <<'TOML'
-
+          # Permanent password + Direct IP Access (port 21118, bypasses public server login!)
+          for CFG in "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk" "/var/root/Library/Preferences/com.carriez.RustDesk"; do
+            sudo mkdir -p "$CFG"
+            printf "password = '%s'\n" "$MAC_PASSWORD" | sudo tee "$CFG/RustDesk.toml" >/dev/null
+            sudo tee "$CFG/RustDesk2.toml" >/dev/null <<'TOML'
           [options]
+          direct-server = 'Y'
+          direct-access-port = '21118'
           verification-method = 'use-permanent-password'
           approve-mode = 'password'
           enable-hwcodec = 'Y'
           allow-remote-config-modification = 'Y'
           enable-audio = 'N'
+          show-remote-cursor = 'Y'
           TOML
-          sudo sed -i '' 's/^          //' "$CFG/RustDesk2.toml"
+            sudo sed -i '' 's/^          //' "$CFG/RustDesk2.toml"
+          done
+          sudo chown -R "$CONSOLE_USER":staff "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk" || true
+
+          # Disable macOS Application Firewall so incoming local/direct connections are never blocked
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off 2>/dev/null || true
 
           UIDN=$(id -u "$CONSOLE_USER")
           sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" open -a /Applications/RustDesk.app
-          sleep 15
+          sleep 10
+          # Ensure --server daemon is active so Direct IP listener binds TCP 21118
+          if ! sudo lsof -nP -iTCP:21118 -sTCP:LISTEN >/dev/null 2>&1; then
+            sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" nohup /Applications/RustDesk.app/Contents/MacOS/RustDesk --server >/tmp/rd_server.log 2>&1 &
+          fi
+          for i in $(seq 1 20); do
+            sudo lsof -nP -iTCP:21118 -sTCP:LISTEN >/dev/null 2>&1 && break
+            sleep 2
+          done
+          echo "=== RustDesk Direct IP Port 21118 Listener ===" | tee -a connection-details/diag.log
+          sudo lsof -nP -iTCP:21118 -sTCP:LISTEN | tee -a connection-details/diag.log || true
+
           sudo -u "$CONSOLE_USER" /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "$MAC_PASSWORD" 2>&1 | tail -2 || true
           RD_ID=""
-          for i in $(seq 1 30); do
+          for i in $(seq 1 20); do
             RD_ID=$(sudo -u "$CONSOLE_USER" /Applications/RustDesk.app/Contents/MacOS/RustDesk --get-id 2>/dev/null | tr -dc '0-9' )
-            [ -z "$RD_ID" ] && RD_ID=$(grep -E "^id *=" "$CFG/RustDesk.toml" 2>/dev/null | grep -oE "[0-9]{6,}" )
+            [ -z "$RD_ID" ] && RD_ID=$(grep -E "^id *=" "/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk/RustDesk.toml" 2>/dev/null | grep -oE "[0-9]{6,}" )
             [ -n "$RD_ID" ] && break
-            sleep 3
+            sleep 2
           done
           echo "RustDesk ID: $RD_ID"
           echo "RD_ID=$RD_ID" >> "$GITHUB_ENV"
-          pgrep -fl RustDesk || true
-          sudo cat "$CFG/RustDesk.toml" | grep -v password || true
           screencapture -x connection-details/7_rustdesk_running.png || true
 
       - name: Setup noVNC, Bore & Cloudflare
@@ -247,25 +263,31 @@ jobs:
 
       - name: Launch Tunnels & Generate Credentials
         run: |
+          nohup bore local 21118 --to bore.pub > /tmp/bore_rd.log 2>&1 &
           nohup bore local 5900 --to bore.pub > /tmp/bore_vnc.log 2>&1 &
           nohup cloudflared tunnel --protocol http2 --url http://127.0.0.1:6080 > /tmp/cf.log 2>&1 &
           for _ in $(seq 1 40); do
+            RD_PORT=$(grep -oE "listening at bore.pub:[0-9]+" /tmp/bore_rd.log | head -1 | cut -d: -f2)
             VNC_PORT=$(grep -oE "listening at bore.pub:[0-9]+" /tmp/bore_vnc.log | head -1 | cut -d: -f2)
             CF_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/cf.log | head -1)
-            [ -n "$VNC_PORT" ] && [ -n "$CF_URL" ] && break
+            [ -n "$RD_PORT" ] && [ -n "$VNC_PORT" ] && [ -n "$CF_URL" ] && break
             sleep 1
           done
+          BORE_IP=$(python3 -c "import socket; print(socket.gethostbyname('bore.pub'))" 2>/dev/null || echo "bore.pub")
+          echo "RD_PORT=$RD_PORT" >> "$GITHUB_ENV"
           echo "VNC_PORT=$VNC_PORT" >> "$GITHUB_ENV"
 
           cat > connection-details/CREDENTIALS.md <<EOF
           # Genuine Apple macOS Remote Desktop
 
+          ## 0. RustDesk Direct IP (NO ACCOUNT / NO LOGIN NEEDED - FASTEST)
+          Enter in Remote ID box: ${BORE_IP}:${RD_PORT}
+          (or hostname)         : bore.pub:${RD_PORT}
+          Password              : ${MAC_PASSWORD}
+          (Optional numeric ID if signed in: ${RD_ID})
+
           ## 1. Browser (HTTPS, one click)
           ${CF_URL}/vnc.html?autoconnect=true&resize=scale&show_dot=true&quality=5&compression=3
-
-          ## 0. RustDesk (FASTEST - recommended)
-          ID      : ${RD_ID}
-          Password: ${MAC_PASSWORD}
 
           ## 2. RealVNC Viewer / TigerVNC
           Address : bore.pub:${VNC_PORT}
@@ -295,6 +317,10 @@ jobs:
             sudo pkill -u mikey -x "Setup Assistant" 2>/dev/null || true
             pgrep -x RustDesk >/dev/null || sudo launchctl asuser $(id -u "$CONSOLE_USER") sudo -u "$CONSOLE_USER" open -a /Applications/RustDesk.app || true
             sudo pkill -u mikey -f "SetupAssistant" 2>/dev/null || true
+            if ! pgrep -f "bore local 21118" > /dev/null; then
+              echo "[!] bore 21118 died, restarting"
+              nohup bore local 21118 --to bore.pub >> /tmp/bore_rd.log 2>&1 &
+            fi
             if ! pgrep -f "bore local 5900" > /dev/null; then
               echo "[!] bore died, restarting (port may change)"
               nohup bore local 5900 --to bore.pub >> /tmp/bore_vnc.log 2>&1 &
