@@ -175,6 +175,62 @@ jobs:
           sleep 3
           screencapture -x connection-details/6_local_after.png || true
 
+      - name: Install & Start RustDesk (fast H.264/VP9 remote, no account)
+        run: |
+          mkdir -p connection-details
+          if [ "$(uname -m)" = "arm64" ]; then A=aarch64; else A=x86_64; fi
+          for i in 1 2 3 4 5; do curl -fsSL -o /tmp/rd.dmg "https://github.com/rustdesk/rustdesk/releases/download/1.5.1/rustdesk-1.5.1-${A}.dmg" && break; sleep 10; done
+          hdiutil attach -nobrowse -quiet /tmp/rd.dmg -mountpoint /tmp/rdmnt
+          sudo cp -R /tmp/rdmnt/RustDesk.app /Applications/
+          hdiutil detach -quiet /tmp/rdmnt || true
+          sudo xattr -dr com.apple.quarantine /Applications/RustDesk.app || true
+          BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /Applications/RustDesk.app/Contents/Info.plist)
+          echo "Bundle id: $BID"
+
+          # Screen Recording / Accessibility / input grants (same fix as Screen Sharing)
+          COLS="service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified"
+          for DB in "/Library/Application Support/com.apple.TCC/TCC.db" "/Users/$CONSOLE_USER/Library/Application Support/com.apple.TCC/TCC.db"; do
+            [ -f "$DB" ] || continue
+            for C in "$BID|0" "/Applications/RustDesk.app/Contents/MacOS/RustDesk|1" "/Applications/RustDesk.app/Contents/MacOS/service|1"; do
+              for SVC in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent kTCCServiceMicrophone; do
+                sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access($COLS) VALUES('$SVC','${C%|*}',${C##*|},2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
+              done
+            done
+          done
+          sudo killall tccd 2>/dev/null || true
+
+          # Permanent password + quality-first options, written before first start
+          CFG="/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk"
+          sudo -u "$CONSOLE_USER" mkdir -p "$CFG"
+          printf "password = '%s'\n" "$MAC_PASSWORD" | sudo -u "$CONSOLE_USER" tee "$CFG/RustDesk.toml" >/dev/null
+          sudo -u "$CONSOLE_USER" tee "$CFG/RustDesk2.toml" >/dev/null <<'TOML'
+
+          [options]
+          verification-method = 'use-permanent-password'
+          approve-mode = 'password'
+          enable-hwcodec = 'Y'
+          allow-remote-config-modification = 'Y'
+          enable-audio = 'N'
+          TOML
+          sudo sed -i '' 's/^          //' "$CFG/RustDesk2.toml"
+
+          UIDN=$(id -u "$CONSOLE_USER")
+          sudo launchctl asuser "$UIDN" sudo -u "$CONSOLE_USER" open -a /Applications/RustDesk.app
+          sleep 15
+          sudo -u "$CONSOLE_USER" /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "$MAC_PASSWORD" 2>&1 | tail -2 || true
+          RD_ID=""
+          for i in $(seq 1 30); do
+            RD_ID=$(sudo -u "$CONSOLE_USER" /Applications/RustDesk.app/Contents/MacOS/RustDesk --get-id 2>/dev/null | tr -dc '0-9' )
+            [ -z "$RD_ID" ] && RD_ID=$(grep -E "^id *=" "$CFG/RustDesk.toml" 2>/dev/null | grep -oE "[0-9]{6,}" )
+            [ -n "$RD_ID" ] && break
+            sleep 3
+          done
+          echo "RustDesk ID: $RD_ID"
+          echo "RD_ID=$RD_ID" >> "$GITHUB_ENV"
+          pgrep -fl RustDesk || true
+          sudo cat "$CFG/RustDesk.toml" | grep -v password || true
+          screencapture -x connection-details/7_rustdesk_running.png || true
+
       - name: Setup noVNC, Bore & Cloudflare
         run: |
           retry() { for i in 1 2 3 4 5 6; do "$@" && return 0; echo "retry $i: $*"; sleep 10; done; return 1; }
@@ -207,6 +263,10 @@ jobs:
           ## 1. Browser (HTTPS, one click)
           ${CF_URL}/vnc.html?autoconnect=true&resize=scale&show_dot=true&quality=5&compression=3
 
+          ## 0. RustDesk (FASTEST - recommended)
+          ID      : ${RD_ID}
+          Password: ${MAC_PASSWORD}
+
           ## 2. RealVNC Viewer / TigerVNC
           Address : bore.pub:${VNC_PORT}
           Password: ${MAC_PASSWORD}
@@ -233,6 +293,7 @@ jobs:
           END=$(( $(date +%s) + 350 * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
             sudo pkill -u mikey -x "Setup Assistant" 2>/dev/null || true
+            pgrep -x RustDesk >/dev/null || sudo launchctl asuser $(id -u "$CONSOLE_USER") sudo -u "$CONSOLE_USER" open -a /Applications/RustDesk.app || true
             sudo pkill -u mikey -f "SetupAssistant" 2>/dev/null || true
             if ! pgrep -f "bore local 5900" > /dev/null; then
               echo "[!] bore died, restarting (port may change)"
