@@ -30,6 +30,8 @@ jobs:
       - name: Setup 32 GB Swap Memory
         run: |
           echo "[*] Creating 32 GB Swap file for maximum memory capacity..."
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
           sudo fallocate -l 32G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=32768
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
