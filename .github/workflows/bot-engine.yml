@@ -1,0 +1,68 @@
+name: CloudForge 24/7 Bot Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_runtime_sec:
+        description: "Max runtime in seconds before seamless self-renewal"
+        required: false
+        default: "20700"
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  watchdog:
+    name: Check Active Engine
+    runs-on: ubuntu-24.04
+    outputs:
+      should_start: ${{ steps.check.outputs.should_start }}
+    steps:
+      - name: Check if Bot Engine is already running
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          CUR_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_start=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ACTIVE=$(gh api "repos/${REPO}/actions/workflows/bot-engine.yml/runs?status=in_progress" \
+            --jq "[.workflow_runs[] | select(.id != (${CUR_RUN_ID} | tonumber))] | length" 2>/dev/null || echo "0")
+          echo "Active other runs: $ACTIVE"
+          if [ "${ACTIVE:-0}" -gt 0 ]; then
+            echo "should_start=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_start=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  engine:
+    name: CloudForge Telegram Bot
+    needs: watchdog
+    if: needs.watchdog.outputs.should_start == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    concurrency:
+      group: cloudforge-bot-engine
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run CloudForge 24/7 Bot Engine
+        env:
+          CLOUDBOT_TOKEN: ${{ secrets.CLOUDBOT_TOKEN }}
+          CLOUDBOT_OWNER_ID: ${{ secrets.CLOUDBOT_OWNER_ID }}
+          CLOUDBOT_DB_KEY: ${{ secrets.CLOUDBOT_DB_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          BOT_MAX_RUNTIME_SEC: ${{ inputs.max_runtime_sec || '20700' }}
+        run: |
+          python3 -m bot.main

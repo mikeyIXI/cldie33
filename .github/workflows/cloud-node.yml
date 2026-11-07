@@ -1,0 +1,57 @@
+name: CloudForge Dedicated Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_id:
+        description: "CloudForge Server ID"
+        required: true
+        type: string
+      runner_os:
+        description: "GitHub Runner OS"
+        required: true
+        default: "ubuntu-24.04"
+        type: string
+      cycle:
+        description: "Renewal Cycle Number"
+        required: false
+        default: "1"
+        type: string
+      max_cycle_sec:
+        description: "Max seconds per cycle before handover"
+        required: false
+        default: "20400"
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  cloud-node:
+    name: "Node ${{ inputs.server_id }} (Cycle #${{ inputs.cycle }})"
+    runs-on: ${{ inputs.runner_os }}
+    timeout-minutes: 360
+    concurrency:
+      group: cloudforge-node-${{ inputs.server_id }}-c${{ inputs.cycle }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout Node Agent
+        uses: actions/checkout@v4
+
+      - name: Launch CloudForge Node Agent
+        shell: bash
+        env:
+          SERVER_ID: ${{ inputs.server_id }}
+          NODE_CYCLE: ${{ inputs.cycle || '1' }}
+          NODE_MAX_CYCLE_SEC: ${{ inputs.max_cycle_sec || '20400' }}
+          CLOUDBOT_DB_KEY: ${{ secrets.CLOUDBOT_DB_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python node/runner_agent.py
+          else
+            python3 node/runner_agent.py
+          fi
