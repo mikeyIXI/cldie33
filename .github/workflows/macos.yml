@@ -149,6 +149,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           MACOS_STATE_KEY: ${{ secrets.MACOS_STATE_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_OWNER_ID: ${{ secrets.TG_OWNER_ID }}
         run: |
           echo "::add-mask::$MAC_PASSWORD"
           mkdir -p connection-details
@@ -179,7 +180,7 @@ jobs:
 
           # Save root-only runtime credentials for state sync & Telegram bot
           STATE_KEY_VAL="${MACOS_STATE_KEY:-${GH_REPO}-fallback-state-key}"
-          sudo python3 - "$GH_TOKEN" "$GH_REPO" "$STATE_KEY_VAL" "$TG_BOT_TOKEN" "$CONSOLE_USER" "$MAC_PASSWORD" <<'PY'
+          sudo python3 - "$GH_TOKEN" "$GH_REPO" "$STATE_KEY_VAL" "$TG_BOT_TOKEN" "$CONSOLE_USER" "$MAC_PASSWORD" "$TG_OWNER_ID" <<'PY'
           import json, os, sys
           cfg = {
               "gh_token": sys.argv[1],
@@ -188,6 +189,7 @@ jobs:
               "tg_token": sys.argv[4],
               "console_user": sys.argv[5],
               "mac_password": sys.argv[6],
+              "tg_owner_id": sys.argv[7],
           }
           p = "/var/root/.macos_state_env.json"
           with open(p, "w") as f:
@@ -198,7 +200,7 @@ jobs:
           # Install macos-state-tool (atomic AES-256 + zstd multi-part backup & restore)
           sudo tee /usr/local/bin/macos-state-tool >/dev/null <<'PYEOF'
           #!/usr/bin/env python3
-          import json, os, shutil, subprocess, sys, tempfile, time
+          import json, os, re, shutil, subprocess, sys, tempfile, time
 
           os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.environ.get("PATH", "")
           CFG = json.load(open("/var/root/.macos_state_env.json"))
@@ -227,6 +229,12 @@ jobs:
               "Arc", "Code", "Cursor", "Telegram Desktop", "discord", "Slack",
               "Obsidian", "VSCodium", "Sublime Text", "JetBrains"
           }
+          SAFE_STORAGE_SERVICES = [
+              "Chrome Safe Storage", "Brave Safe Storage", "Chromium Safe Storage",
+              "Microsoft Edge Safe Storage", "Arc Safe Storage", "Code Safe Storage",
+              "Cursor Safe Storage", "discord Safe Storage", "Slack Safe Storage",
+              "Obsidian Safe Storage", "VSCodium Safe Storage"
+          ]
           SKIP_APPSUPPORT = {
               "Apple", "Caches", "CrashReporter", "CloudDocs", "FileProvider",
               "Knowledge", "MobileSync", "AddressBook", "CallHistoryDB",
@@ -302,6 +310,28 @@ jobs:
               r = run(["sudo", "-u", USER, "brew", "list", f"--{kind}"], capture_output=True, text=True)
               return sorted(r.stdout.split()) if r.returncode == 0 else []
 
+          def export_safe_storage_keys():
+              kc = os.path.join(HOME, "Library", "Keychains", "login.keychain-db")
+              found = []
+              for svc in SAFE_STORAGE_SERVICES:
+                  pw_r = run(["sudo", "-u", USER, "security", "find-generic-password", "-s", svc, "-w", kc], capture_output=True, text=True)
+                  if pw_r.returncode != 0 or not pw_r.stdout.strip():
+                      continue
+                  meta_r = run(["sudo", "-u", USER, "security", "find-generic-password", "-s", svc, kc], capture_output=True, text=True)
+                  m = re.search(r'"acct"<blob>="(.*?)"', meta_r.stdout)
+                  acct = m.group(1) if m else svc.split()[0]
+                  found.append({"service": svc, "account": acct, "password": pw_r.stdout.strip()})
+              return found
+
+          def import_safe_storage_keys(keys):
+              kc = os.path.join(HOME, "Library", "Keychains", "login.keychain-db")
+              for item in keys:
+                  run([
+                      "sudo", "-u", USER, "security", "add-generic-password",
+                      "-U", "-a", item["account"], "-s", item["service"],
+                      "-w", item["password"], "-T", "", kc
+                  ], capture_output=True)
+
           def do_baseline():
               prefs_dir = os.path.join(HOME, "Library", "Preferences")
               prefs = {}
@@ -315,6 +345,8 @@ jobs:
                   "apps": list_dir("/Applications"),
                   "home_top": list_dir(HOME),
                   "app_support": list_dir(os.path.join(HOME, "Library", "Application Support")),
+                  "containers": list_dir(os.path.join(HOME, "Library", "Containers")),
+                  "group_containers": list_dir(os.path.join(HOME, "Library", "Group Containers")),
                   "prefs": prefs,
                   "brew_formula": brew_list("formula"),
                   "brew_cask": brew_list("cask"),
@@ -330,7 +362,7 @@ jobs:
                   r = run(["gh", "release", "download", TAG, "-R", REPO, "-p", "manifest.json.enc", "-D", d], capture_output=True)
                   mp = os.path.join(d, "manifest.json.enc")
                   if r.returncode != 0 or not os.path.exists(mp):
-                      msg = "أول جلسة جديدة (جاهزة لحفظ جميع ملفاتك وتطبيقاتك تلقائيًا)"
+                      msg = "أول جلسة جديدة (جاهزة لحفظ جميع ملفاتك وحساباتك تلقائيًا)"
                       open("/var/tmp/restore_summary.txt", "w").write(msg)
                       print("[restore] No previous snapshot yet — fresh session.")
                       return
@@ -378,7 +410,6 @@ jobs:
                   home_stage = os.path.join(stage, "user_home")
                   if os.path.isdir(home_stage):
                       run(["rsync", "-a", f"{home_stage}/", f"{HOME}/"])
-                      # Fix ownership on restored top-level & Library paths without touching giant Xcode dirs
                       for item in os.listdir(home_stage):
                           target = os.path.join(HOME, item)
                           if item == "Library":
@@ -387,7 +418,14 @@ jobs:
                                   run(["chown", "-R", f"{USER}:staff", sub_p], capture_output=True)
                           else:
                               run(["chown", "-R", f"{USER}:staff", target], capture_output=True)
-                      run(["killall", "cfprefsd", "secd"], capture_output=True)
+                      run(["killall", "cfprefsd", "nsurlstoraged"], capture_output=True)
+
+                  ss_path = os.path.join(stage, "safe_storage_keys.json")
+                  if os.path.exists(ss_path):
+                      try:
+                          import_safe_storage_keys(json.load(open(ss_path)))
+                      except Exception as e:
+                          print("[restore] Keychain Safe Storage import warning:", e)
 
                   brew_added = manifest.get("brew_added", [])
                   if brew_added:
@@ -399,7 +437,7 @@ jobs:
                           "apps": restored_apps,
                           "open_apps": manifest.get("open_apps", []),
                       }, f)
-                  msg = f"تم استرجاع جميع ملفاتك وتطبيقاتك بالكامل ({manifest.get('size_mb', 0):.1f} MB) ✅"
+                  msg = f"تم استرجاع جميع ملفاتك وحساباتك وتطبيقاتك بالكامل ({manifest.get('size_mb', 0):.1f} MB) ✅"
                   open("/var/tmp/restore_summary.txt", "w").write(msg)
                   print(f"[restore] Completed! Restored apps: {restored_apps}")
 
@@ -432,6 +470,8 @@ jobs:
               base_apps = set(base.get("apps", [])) | {"RustDesk.app"}
               base_home = set(base.get("home_top", []))
               base_as = set(base.get("app_support", []))
+              base_cont = set(base.get("containers", []))
+              base_gcont = set(base.get("group_containers", []))
               base_prefs = base.get("prefs", {})
               base_brew = set(base.get("brew_formula", []))
 
@@ -460,7 +500,7 @@ jobs:
                           continue
                       rsync_copy(os.path.join(HOME, item), os.path.join(u_stage, item))
 
-                  # 3. ~/Library/Application Support (browsers, apps, user data)
+                  # 3. ~/Library/Application Support (Chrome, Brave, Firefox, Telegram, VS Code, Discord, etc.)
                   as_dir = os.path.join(HOME, "Library", "Application Support")
                   for item in list_dir(as_dir):
                       if item in SKIP_APPSUPPORT or item.startswith("com.apple."):
@@ -468,13 +508,29 @@ jobs:
                       if (item not in base_as) or (item in ALWAYS_SYNC_APPSUPPORT):
                           rsync_copy(os.path.join(as_dir, item), os.path.join(u_stage, "Library", "Application Support", item))
 
-                  # 4. Safari, Cookies & Keychains
-                  for lib_sub in ["Safari", "Cookies", "Keychains"]:
+                  # 4. Safari logins/cookies/WebKit + Sandboxed App Containers
+                  for lib_sub in ["Safari", "Cookies", "HTTPStorages", "WebKit"]:
                       src = os.path.join(HOME, "Library", lib_sub)
                       if os.path.exists(src):
                           rsync_copy(src, os.path.join(u_stage, "Library", lib_sub))
 
-                  # 5. Modified & new Preferences + RustDesk config
+                  cont_dir = os.path.join(HOME, "Library", "Containers")
+                  for c in list_dir(cont_dir):
+                      if c == "com.apple.Safari" or (c not in base_cont and not c.startswith("com.apple.")):
+                          rsync_copy(os.path.join(cont_dir, c), os.path.join(u_stage, "Library", "Containers", c))
+
+                  gcont_dir = os.path.join(HOME, "Library", "Group Containers")
+                  for gc in list_dir(gcont_dir):
+                      if gc not in base_gcont and "apple" not in gc.lower():
+                          rsync_copy(os.path.join(gcont_dir, gc), os.path.join(u_stage, "Library", "Group Containers", gc))
+
+                  # 5. Export Browser & App Keychain Safe Storage encryption keys cleanly
+                  ss_keys = export_safe_storage_keys()
+                  if ss_keys:
+                      with open(os.path.join(stage, "safe_storage_keys.json"), "w") as ssf:
+                          json.dump(ss_keys, ssf)
+
+                  # 6. Modified & new Preferences + RustDesk config
                   prefs_dir = os.path.join(HOME, "Library", "Preferences")
                   for f in list_dir(prefs_dir):
                       if f == "ByHost" or f.startswith(SKIP_PREF_PREFIXES):
@@ -487,7 +543,7 @@ jobs:
                       if f == "com.carriez.RustDesk" or (f not in base_prefs) or (mt > base_prefs.get(f, 0)):
                           rsync_copy(fp, os.path.join(u_stage, "Library", "Preferences", f))
 
-                  # 6. Newly installed /Applications/*.app bundles
+                  # 7. Newly installed /Applications/*.app bundles
                   for app in list_dir("/Applications"):
                       if app not in base_apps and not app.startswith("."):
                           rsync_copy(os.path.join("/Applications", app), os.path.join(a_stage, app))
@@ -575,13 +631,15 @@ jobs:
           PYEOF
           sudo chmod +x /usr/local/bin/macos-state-tool
 
-          # Install Telegram Bot daemon (auto-discovers chat_id, pushes renewal IPs & handles /ip /save /status /stop)
+          # Install Telegram Bot daemon (strictly locked to TG_OWNER_ID)
           sudo tee /usr/local/bin/macos-tg-bot >/dev/null <<'PYEOF'
           #!/usr/bin/env python3
           import html, json, os, shutil, subprocess, sys, time, urllib.parse, urllib.request
 
           CFG = json.load(open("/var/root/.macos_state_env.json"))
           TOKEN = CFG.get("tg_token", "").strip()
+          OWNER_STR = CFG.get("tg_owner_id", "").strip()
+          OWNER_ID = int(OWNER_STR) if OWNER_STR.lstrip("-").isdigit() else None
           if not TOKEN:
               print("[tg] No TG_BOT_TOKEN configured, exiting.")
               sys.exit(0)
@@ -597,16 +655,6 @@ jobs:
               req = urllib.request.Request(url, data=data, headers=headers)
               with urllib.request.urlopen(req, timeout=timeout) as resp:
                   return json.loads(resp.read().decode("utf-8"))
-
-          def load_chats():
-              r = subprocess.run(["/usr/local/bin/macos-state-tool", "get-chats"], capture_output=True, text=True)
-              try:
-                  return set(json.loads(r.stdout.strip()))
-              except Exception:
-                  return set()
-
-          def save_chat(cid):
-              subprocess.run(["/usr/local/bin/macos-state-tool", "add-chat", str(cid)], check=False)
 
           def format_conn_card(header="🍎 تم تشغيل وتجهيز جهاز macOS بنجاح!"):
               try:
@@ -625,9 +673,9 @@ jobs:
                   f"🖥 <b>اتصال VNC بديل:</b> <code>{html.escape(c['vnc_addr'])}</code>\n\n"
                   f"📦 <b>حالة البيانات:</b> {html.escape(c['restore_msg'])}\n"
                   f"⏳ <b>التجديد التلقائي القادم:</b> بعد {hrs} ساعة و {mins} دقيقة\n\n"
-                  f"💡 <b>أوامر التحكم من التليجرام:</b>\n"
+                  f"💡 <b>أوامر التحكم من التليجرام (خاص بك فقط):</b>\n"
                   f"/ip — عرض الـ IP والروابط الحالية\n"
-                  f"/save — حفظ نسخة فورية لملفاتك الآن\n"
+                  f"/save — حفظ نسخة فورية لملفاتك وحساباتك الآن\n"
                   f"/status — حالة الجهاز والمساحة والوقت\n"
                   f"/stop — حفظ البيانات وإيقاف التجديد التلقائي"
               )
@@ -642,47 +690,40 @@ jobs:
                   })
                   return True
               except Exception as e:
-                  print(f"[tg] sendMessage to {cid} failed: {e}", flush=True)
+                  print(f"[tg] sendMessage failed: {e}", flush=True)
                   return False
 
           try:
               me = tg_call("getMe")
               bot_user = me.get("result", {}).get("username", "unknown")
-              print(f"[tg] Connected to Telegram Bot: @{bot_user}", flush=True)
+              print(f"[tg] Connected to Telegram Bot: @{bot_user} (locked to owner={bool(OWNER_ID)})", flush=True)
               tg_call("deleteWebhook", {"drop_pending_updates": False})
           except Exception as e:
               print(f"[tg] Failed connecting to Telegram API: {e}", flush=True)
               sys.exit(1)
 
-          chats = load_chats()
+          chats = {OWNER_ID} if OWNER_ID else set()
           offset = 0
 
-          # Initial poll to discover chat_id if user already messaged the bot
+          # Drain pending updates to advance offset cleanly
           try:
-              ups = tg_call("getUpdates", {"timeout": 2}, timeout=10).get("result", [])
+              ups = tg_call("getUpdates", {"timeout": 1}, timeout=10).get("result", [])
               for u in ups:
                   offset = max(offset, u["update_id"] + 1)
-                  msg = u.get("message") or u.get("edited_message") or u.get("my_chat_member") or {}
-                  cid = msg.get("chat", {}).get("id")
-                  if cid and cid not in chats:
-                      chats.add(cid)
-                      save_chat(cid)
-                      print(f"[tg] Discovered & saved chat_id: {cid}", flush=True)
+                  if not OWNER_ID:
+                      msg = u.get("message") or u.get("my_chat_member") or {}
+                      cid = msg.get("chat", {}).get("id")
+                      if cid:
+                          chats.add(cid)
           except Exception as e:
               print(f"[tg] Initial getUpdates warning: {e}", flush=True)
 
-          startup_sent = False
           if chats:
               card = format_conn_card("🍎 جهاز macOS جاهز الآن (تم نقل واسترجاع بياناتك)!")
-              for cid in list(chats):
-                  if send_msg(cid, card):
-                      startup_sent = True
-              print(f"[tg] Startup notification sent to {len(chats)} chat(s).", flush=True)
-          else:
-              print(f"[tg] No chat_id saved yet — send /start to @{bot_user} on Telegram to link!", flush=True)
+              sent_ok = any(send_msg(cid, card) for cid in list(chats))
+              print(f"[tg] Instant owner notification sent={sent_ok}", flush=True)
 
           while True:
-              # Flush any queued system notifications (tunnel port changes, handover alerts)
               for fn in sorted(os.listdir(QUEUE_DIR)):
                   fp = os.path.join(QUEUE_DIR, fn)
                   try:
@@ -700,27 +741,26 @@ jobs:
                       offset = max(offset, u["update_id"] + 1)
                       msg = u.get("message") or {}
                       cid = msg.get("chat", {}).get("id")
+                      uid = (msg.get("from") or {}).get("id")
                       text = (msg.get("text") or "").strip()
                       if not cid:
-                          mc = u.get("my_chat_member", {}).get("chat", {}).get("id")
-                          if mc and mc not in chats:
-                              chats.add(mc)
-                              save_chat(mc)
-                              send_msg(mc, format_conn_card())
                           continue
-                      is_new = cid not in chats
-                      if is_new:
+
+                      # Strict owner-only enforcement: silently ignore any other Telegram user/chat
+                      if OWNER_ID and (cid != OWNER_ID or (uid and uid != OWNER_ID)):
+                          print(f"[tg] Ignored unauthorized message from uid={uid} cid={cid}", flush=True)
+                          continue
+
+                      if not OWNER_ID and cid not in chats:
                           chats.add(cid)
-                          save_chat(cid)
-                          print(f"[tg] Linked new chat_id: {cid}", flush=True)
 
                       cmd = text.split()[0].lower() if text else ""
-                      if is_new or cmd in ("/start", "/ip", "ايبي", "ip"):
+                      if cmd in ("/start", "/ip", "ايبي", "ip"):
                           send_msg(cid, format_conn_card())
                       elif cmd in ("/save", "حفظ"):
-                          send_msg(cid, "⏳ جاري حفظ وتشفير جميع ملفاتك وتطبيقاتك الآن...")
+                          send_msg(cid, "⏳ جاري حفظ وتشفير جميع ملفاتك وحساباتك وتطبيقاتك الآن...")
                           subprocess.run(["/usr/local/bin/macos-state-tool", "backup", "manual"], check=False)
-                          send_msg(cid, "✅ تم حفظ نسخة مشفرة محدثة لجميع بياناتك بنجاح!")
+                          send_msg(cid, "✅ تم حفظ نسخة مشفرة محدثة لجميع بياناتك وحساباتك بنجاح!")
                       elif cmd in ("/status", "حالة"):
                           c = json.load(open("/var/tmp/current_conn.json"))
                           rem_min = max(0, int((c["end_epoch"] - time.time()) / 60))
