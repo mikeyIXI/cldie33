@@ -68,16 +68,16 @@ jobs:
           echo "======================================================"
           echo " Configuring macOS Users & Screen Sharing (ARDAgent)"
           echo "======================================================"
-          set -e
+          # Create dedicated admin user mikey with desired password
+          echo "[*] Creating dedicated macOS admin user 'mikey'..."
+          sudo sysadminctl -addUser mikey -password "$MAC_PASSWORD" -admin || true
 
-          # Set password for runner and root
-          echo "[*] Updating runner and root passwords..."
-          sudo dscl . -passwd /Users/runner "$MAC_PASSWORD"
-          sudo dscl . -passwd /Users/root "$MAC_PASSWORD"
+          # Also attempt resetting runner password gracefully
+          sudo sysadminctl -resetPasswordFor runner -newPassword "$MAC_PASSWORD" || true
 
           # Configure auto-login for user runner
           echo "[*] Configuring auto-login for runner..."
-          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser runner
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser runner || true
 
           # Generate legacy VNC password hash for compatibility with standard VNC clients
           echo "[*] Generating VNC legacy password..."
@@ -85,11 +85,11 @@ jobs:
           sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
 
           # Configure Apple Remote Management / Screen Sharing via kickstart
-          echo "[*] Activating Apple Remote Desktop Agent..."
+          echo "[*] Activating Apple Remote Desktop Agent & setting VNC password..."
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate \
             -configure -allowAccessFor -allUsers -privs -all \
-            -configure -clientopts -setvnclegacy -vnclegacy yes \
+            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$MAC_PASSWORD" \
             -configure -clientopts -setmenuextra -menuextra yes \
             -restart -agent -console
 
@@ -173,7 +173,7 @@ jobs:
           EOF
 
           echo "Host / Address : bore.pub:${VNC_PORT}" >> connection-details/CREDENTIALS.md
-          echo "Username       : runner" >> connection-details/CREDENTIALS.md
+          echo "Username       : runner (or mikey)" >> connection-details/CREDENTIALS.md
           echo "Password       : ${MAC_PASSWORD}" >> connection-details/CREDENTIALS.md
 
           cat << 'EOF' >> connection-details/CREDENTIALS.md
