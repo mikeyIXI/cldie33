@@ -91,6 +91,21 @@ jobs:
           # Extra admin account for clients that ask for username (ARD auth)
           sudo sysadminctl -addUser mikey -fullName "Mikey" -password "$MAC_PASSWORD" -admin 2>&1 | grep -v -- "----" || true
 
+          # Skip Setup Assistant (Apple ID / "Create account" screens) for mikey so the
+          # first login goes straight to the desktop with no Apple account needed.
+          sudo touch /var/db/.AppleSetupDone
+          MH=/Users/mikey
+          sudo mkdir -p "$MH/Library/Preferences"
+          VER=$(sw_vers -productVersion); BLD=$(sw_vers -buildVersion)
+          SA="$MH/Library/Preferences/com.apple.SetupAssistant"
+          for K in DidSeeCloudSetup DidSeeSiriSetup DidSeeApplePaySetup DidSeeAvatarSetup DidSeeAccessibility DidSeeScreenTimeSetup DidSeeTouchIDSetup DidSeeTrueTone DidSeeActivationLock DidSeePrivacy DidSeeSyncSetup DidSeeSyncSetup2 DidSeeAppearanceSetup DidSeeIntelligence GestureMovieSeen; do
+            sudo defaults write "$SA" "$K" -bool true
+          done
+          sudo defaults write "$SA" LastSeenCloudProductVersion -string "$VER"
+          sudo defaults write "$SA" LastSeenBuddyBuildVersion -string "$BLD"
+          sudo defaults write "$SA" LastPreLoginTasksPerformedVersion -string "$VER"
+          sudo chown -R mikey:staff "$MH/Library" 2>/dev/null || sudo chown -R mikey "$MH/Library" || true
+
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -allowAccessFor -allUsers -privs -all \
             -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$MAC_PASSWORD" \
@@ -179,6 +194,8 @@ jobs:
         run: |
           END=$(( $(date +%s) + 350 * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
+            sudo pkill -u mikey -x "Setup Assistant" 2>/dev/null || true
+            sudo pkill -u mikey -f "SetupAssistant" 2>/dev/null || true
             if ! pgrep -f "bore local 5900" > /dev/null; then
               echo "[!] bore died, restarting (port may change)"
               nohup bore local 5900 --to bore.pub >> /tmp/bore_vnc.log 2>&1 &
