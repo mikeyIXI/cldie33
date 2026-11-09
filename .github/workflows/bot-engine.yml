@@ -71,7 +71,7 @@ jobs:
           GH_REF: ${{ github.ref_name }}
           BOT_MAX_RUNTIME_SEC: ${{ inputs.max_runtime_sec || '20700' }}
         run: |
-          python3 - <<'PY'
+          exec python3 -u - <<'PY'
           import hashlib, hmac, json, os, shutil, sys, tempfile, zlib
 
           vkeys = [
