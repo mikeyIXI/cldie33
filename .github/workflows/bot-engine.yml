@@ -24,7 +24,7 @@ jobs:
     outputs:
       should_start: ${{ steps.check.outputs.should_start }}
     steps:
-      - name: Check if Bot Engine is already running
+      - name: Check if Bot Engine is already running (with Zombie Heartbeat Recovery)
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -36,14 +36,67 @@ jobs:
             echo "should_start=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          ACTIVE=$(gh api "repos/${REPO}/actions/workflows/bot-engine.yml/runs?per_page=15" \
-            --jq "[.workflow_runs[] | select(.id != (${CUR_RUN_ID} | tonumber) and (.status == \"in_progress\" or (.status == \"queued\" and .event == \"workflow_dispatch\")))] | length" 2>/dev/null || echo "0")
-          echo "Active other runs: $ACTIVE"
-          if [ "${ACTIVE:-0}" -gt 0 ]; then
-            echo "should_start=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_start=true" >> "$GITHUB_OUTPUT"
-          fi
+          python3 - <<'PY'
+          import calendar, json, os, subprocess, time
+
+          repo = os.environ["REPO"]
+          cur_id = int(os.environ["CUR_RUN_ID"])
+          out_file = os.environ["GITHUB_OUTPUT"]
+          now = int(time.time())
+
+          def gh_json(args):
+              r = subprocess.run(["gh", "api"] + args, capture_output=True, text=True)
+              if r.returncode != 0 or not r.stdout.strip():
+                  return {}
+              try:
+                  return json.loads(r.stdout)
+              except Exception:
+                  return {}
+
+          def parse_ts(s):
+              if not s or len(s) < 19:
+                  return now
+              try:
+                  return int(calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")))
+              except Exception:
+                  return now
+
+          runs_data = gh_json([f"repos/{repo}/actions/workflows/bot-engine.yml/runs?per_page=15"])
+          others = [
+              w for w in runs_data.get("workflow_runs", [])
+              if int(w.get("id") or 0) != cur_id
+              and (w.get("status") == "in_progress" or (w.get("status") == "queued" and w.get("event") == "workflow_dispatch"))
+          ]
+          if not others:
+              print("No active BotEngine runs found — starting fresh instance.")
+              with open(out_file, "a") as f:
+                  f.write("should_start=true\n")
+              raise SystemExit(0)
+
+          all_old = all((now - parse_ts(w.get("run_started_at") or w.get("created_at"))) > 600 for w in others)
+          stale_hb = False
+          if all_old:
+              rel = gh_json([f"repos/{repo}/releases/tags/cloudbot-state"])
+              for a in rel.get("assets", []):
+                  if a.get("name") == "cloudbot.db.enc":
+                      hb_age = now - parse_ts(a.get("updated_at"))
+                      print(f"cloudbot.db.enc heartbeat age: {hb_age}s")
+                      if hb_age > 900:
+                          stale_hb = True
+                      break
+
+          if all_old and stale_hb:
+              print(f"Detected zombie BotEngine run(s) {[w['id'] for w in others]} (DB heartbeat >900s stale) — cancelling & recovering!")
+              for w in others:
+                  subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{w['id']}/cancel"], capture_output=True)
+              time.sleep(4)
+              with open(out_file, "a") as f:
+                  f.write("should_start=true\n")
+          else:
+              print(f"Healthy active BotEngine run(s) {[w['id'] for w in others]} — skipping scheduled start.")
+              with open(out_file, "a") as f:
+                  f.write("should_start=false\n")
+          PY
 
   engine:
     name: CloudForge Telegram Bot
