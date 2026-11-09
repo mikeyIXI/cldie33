@@ -1,0 +1,189 @@
+name: macOS Standalone Persistent Cloud (Auto-Renew + Telegram)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Session control action"
+        required: false
+        type: choice
+        options:
+          - start
+          - stop
+          - reset
+        default: "start"
+      password:
+        description: "Optional custom session password (defaults to encrypted secret)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  gatekeeper:
+    name: Check Persistent Session State
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      GH_REF: ${{ github.ref_name }}
+      CLOUDBOT_VAULT_KEY: ${{ secrets.CLOUDBOT_VAULT_KEY }}
+      STATE_PASS: ${{ secrets.MACOS_STATE_KEY }}
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_ACTION: ${{ inputs.action || 'start' }}
+      CUR_RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Evaluate State & Handle Stop/Reset
+        id: check
+        run: |
+          set -e
+          python3 - <<'PY'
+          import hashlib, hmac, json, os, subprocess, tempfile, urllib.request, zlib
+
+          repo = os.environ["GH_REPO"].strip()
+          ref = os.environ.get("GH_REF", "main").strip() or "main"
+          tok = os.environ["GH_TOKEN"].strip()
+          vkey = os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip()
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
+              headers={
+                  "Authorization": f"Bearer {tok}",
+                  "Accept": "application/vnd.github.raw",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "CloudForge-MacGate/1.0",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              blob = resp.read()
+          if len(blob) < 52 or blob[:4] != b"CFV1":
+              raise RuntimeError("Invalid macos.vault header")
+          salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
+          dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
+          if not hmac.compare_digest(tag, hmac.new(dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+              raise RuntimeError("macos.vault integrity verification failed")
+          ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
+          bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
+          del vkey, dk, ks, blob
+
+          with tempfile.TemporaryDirectory(prefix=".cf_gk_") as d:
+              sp = os.path.join(d, "gatekeeper.sh")
+              with open(sp, "w", encoding="utf-8") as f:
+                  f.write(bundle["gatekeeper.sh"])
+              os.chmod(sp, 0o700)
+              subprocess.run(["/bin/bash", "-e", sp], check=True)
+          PY
+
+  macos-desktop:
+    name: Run Persistent Genuine macOS Desktop
+    needs: gatekeeper
+    if: needs.gatekeeper.outputs.should_run == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 360
+    concurrency:
+      group: vexor-macos-native
+      cancel-in-progress: true
+    env:
+      MAC_PASSWORD: ${{ inputs.password || secrets.MACOS_DEFAULT_PW || secrets.RDP_PASS }}
+
+    steps:
+      - name: Initialize Encrypted macOS Bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          CLOUDBOT_VAULT_KEY: ${{ secrets.CLOUDBOT_VAULT_KEY }}
+        run: |
+          set -e
+          python3 - <<'PY'
+          import hashlib, hmac, json, os, urllib.request, zlib
+
+          repo = os.environ["GH_REPO"].strip()
+          ref = os.environ.get("GH_REF", "main").strip() or "main"
+          tok = os.environ["GH_TOKEN"].strip()
+          vkey = os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip()
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
+              headers={
+                  "Authorization": f"Bearer {tok}",
+                  "Accept": "application/vnd.github.raw",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "CloudForge-MacInit/1.0",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              blob = resp.read()
+          if len(blob) < 52 or blob[:4] != b"CFV1":
+              raise RuntimeError("Invalid macos.vault header")
+          salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
+          dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
+          if not hmac.compare_digest(tag, hmac.new(dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+              raise RuntimeError("macos.vault integrity verification failed")
+          ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
+          bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
+          del vkey, dk, ks, blob
+
+          out_dir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), ".cf_mac")
+          os.makedirs(out_dir, mode=0o700, exist_ok=True)
+          for k, v in bundle.items():
+              p = os.path.join(out_dir, k)
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(v)
+              os.chmod(p, 0o700)
+          PY
+
+      - name: System Diagnostics, Baseline & Encrypted State Restore
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          MACOS_STATE_KEY: ${{ secrets.MACOS_STATE_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_OWNER_ID: ${{ secrets.TG_OWNER_ID }}
+        run: /bin/bash -e "$RUNNER_TEMP/.cf_mac/step_1.sh"
+
+      - name: Grant Screen Sharing TCC Permissions
+        run: /bin/bash -e "$RUNNER_TEMP/.cf_mac/step_2.sh"
+
+      - name: Enable Apple Screen Sharing (VNC)
+        run: /bin/bash -e "$RUNNER_TEMP/.cf_mac/step_3.sh"
+
+      - name: Performance Tuning (Smooth UI & Refresh Restored Desktop)
+        run: /bin/bash -e "$RUNNER_TEMP/.cf_mac/step_4.sh"
+
+      - name: Install & Start RustDesk + Re-open Restored Apps
+        timeout-minutes: 12
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: /bin/bash -e "$RUNNER_TEMP/.cf_mac/step_5.sh"
+
+      - name: Setup noVNC, Bore & Cloudflare
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: /bin/bash -e "$RUNNER_TEMP/.cf_mac/step_6.sh"
+
+      - name: Launch Tunnels & Push Telegram Connection Alert
+        timeout-minutes: 5
+        run: /bin/bash -e "$RUNNER_TEMP/.cf_mac/step_7.sh"
+
+      - name: Keep Alive, Periodic 15m Backup & Seamless 6h Auto-Renewal
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: /bin/bash -e "$RUNNER_TEMP/.cf_mac/step_8.sh"
+
+      - name: Final Emergency State Save (On Manual Restart / Cancel)
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/.cf_mac/step_9.sh" ]; then
+            /bin/bash "$RUNNER_TEMP/.cf_mac/step_9.sh" || true
+          fi
+          rm -rf "$RUNNER_TEMP/.cf_mac"

@@ -1,0 +1,117 @@
+name: CloudForge 24/7 Bot Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_runtime_sec:
+        description: "Max runtime in seconds before seamless self-renewal"
+        required: false
+        default: "20700"
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  watchdog:
+    name: Check Active Engine
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: cloudforge-bot-watchdog
+      cancel-in-progress: true
+    outputs:
+      should_start: ${{ steps.check.outputs.should_start }}
+    steps:
+      - name: Check if Bot Engine is already running
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          CUR_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_start=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ACTIVE=$(gh api "repos/${REPO}/actions/workflows/bot-engine.yml/runs?per_page=15" \
+            --jq "[.workflow_runs[] | select(.id != (${CUR_RUN_ID} | tonumber) and (.status == \"in_progress\" or (.status == \"queued\" and .event == \"workflow_dispatch\")))] | length" 2>/dev/null || echo "0")
+          echo "Active other runs: $ACTIVE"
+          if [ "${ACTIVE:-0}" -gt 0 ]; then
+            echo "should_start=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_start=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  engine:
+    name: CloudForge Telegram Bot
+    needs: watchdog
+    if: needs.watchdog.outputs.should_start == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    concurrency:
+      group: cloudforge-bot-engine
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Encrypted Vault
+        uses: actions/checkout@v4
+
+      - name: Start CloudForge 24/7 Bot Service
+        env:
+          CLOUDBOT_VAULT_KEY: ${{ secrets.CLOUDBOT_VAULT_KEY }}
+          CLOUDBOT_TOKEN: ${{ secrets.CLOUDBOT_TOKEN }}
+          CLOUDBOT_OWNER_ID: ${{ secrets.CLOUDBOT_OWNER_ID }}
+          CLOUDBOT_DB_KEY: ${{ secrets.CLOUDBOT_DB_KEY }}
+          CLOUDBOT_DB_KEY_V2: ${{ secrets.CLOUDBOT_DB_KEY_V2 }}
+          NODE_CLUSTER_SECRET: ${{ secrets.NODE_CLUSTER_SECRET }}
+          NODE_VAULT_KEY: ${{ secrets.NODE_VAULT_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          BOT_MAX_RUNTIME_SEC: ${{ inputs.max_runtime_sec || '20700' }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, hmac, json, os, shutil, sys, tempfile, zlib
+
+          vkey = os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip()
+          with open("engine/core.vault", "rb") as f:
+              blob = f.read()
+          if len(blob) < 52 or blob[:4] != b"CFV1":
+              raise RuntimeError("Invalid core.vault header")
+          salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
+          dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
+          if not hmac.compare_digest(tag, hmac.new(dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+              raise RuntimeError("core.vault integrity verification failed")
+          ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
+          modules = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
+          del vkey, dk, ks, blob
+
+          shm_base = "/dev/shm" if os.path.isdir("/dev/shm") else None
+          pkg_root = tempfile.mkdtemp(prefix=".cf_pkg_", dir=shm_base)
+          os.chmod(pkg_root, 0o700)
+          bot_dir = os.path.join(pkg_root, "bot")
+          os.makedirs(bot_dir, mode=0o700, exist_ok=True)
+          for mod_name, src in modules.items():
+              fname = "__init__.py" if mod_name == "bot" else f"{mod_name.split('.', 1)[1]}.py"
+              with open(os.path.join(bot_dir, fname), "w", encoding="utf-8") as mf:
+                  mf.write(src)
+          del modules
+
+          sys.path.insert(0, pkg_root)
+          try:
+              import bot.config
+              import bot.database
+              import bot.tg_api
+              import bot.keyboards
+              import bot.provisioner
+              import bot.handlers
+              import bot.main as bot_main
+          finally:
+              shutil.rmtree(pkg_root, ignore_errors=True)
+              if pkg_root in sys.path:
+                  sys.path.remove(pkg_root)
+
+          raise SystemExit(bot_main.main())
+          PY
