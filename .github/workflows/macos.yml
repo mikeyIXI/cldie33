@@ -34,6 +34,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       GH_REF: ${{ github.ref_name }}
       CLOUDBOT_VAULT_KEY: ${{ secrets.CLOUDBOT_VAULT_KEY }}
+      CLOUDBOT_VAULT_KEY_PREV: ${{ secrets.CLOUDBOT_VAULT_KEY_PREV }}
       STATE_PASS: ${{ secrets.MACOS_STATE_KEY }}
       EVENT_NAME: ${{ github.event_name }}
       INPUT_ACTION: ${{ inputs.action || 'start' }}
@@ -44,33 +45,64 @@ jobs:
         run: |
           set -e
           python3 - <<'PY'
-          import hashlib, hmac, json, os, subprocess, tempfile, urllib.request, zlib
+          import hashlib, hmac, json, os, subprocess, tempfile, time, urllib.request, zlib
 
           repo = os.environ["GH_REPO"].strip()
           ref = os.environ.get("GH_REF", "main").strip() or "main"
           tok = os.environ["GH_TOKEN"].strip()
-          vkey = os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip()
+          vkeys = [
+              k for k in (
+                  os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip(),
+                  os.environ.pop("CLOUDBOT_VAULT_KEY_PREV", "").strip(),
+              ) if k
+          ]
 
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
-              headers={
-                  "Authorization": f"Bearer {tok}",
-                  "Accept": "application/vnd.github.raw",
-                  "X-GitHub-Api-Version": "2022-11-28",
-                  "User-Agent": "CloudForge-MacGate/1.0",
-              },
-          )
-          with urllib.request.urlopen(req, timeout=30) as resp:
-              blob = resp.read()
-          if len(blob) < 52 or blob[:4] != b"CFV1":
-              raise RuntimeError("Invalid macos.vault header")
+          sources = [
+              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault", {"User-Agent": "CloudForge-MacGate/2.0"}),
+              (
+                  f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
+                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacGate/2.0"},
+              ),
+              (
+                  f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
+                  {
+                      "Authorization": f"Bearer {tok}",
+                      "Accept": "application/vnd.github.raw",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "CloudForge-MacGate/2.0",
+                  },
+              ),
+          ]
+          blob = b""
+          last_err = None
+          for attempt in range(4):
+              for u_src, h_src in sources:
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(u_src, headers=h_src), timeout=25) as resp:
+                          cand_blob = resp.read()
+                          if len(cand_blob) >= 52 and cand_blob[:4] == b"CFV1":
+                              blob = cand_blob
+                              break
+                  except Exception as exc:
+                      last_err = exc
+              if blob:
+                  break
+              time.sleep(1.5 * (attempt + 1))
+          if not blob:
+              raise RuntimeError(f"Failed fetching macos.vault: {last_err}")
+
           salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
-          dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
-          if not hmac.compare_digest(tag, hmac.new(dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+          dk = None
+          for vkey in vkeys:
+              cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
+              if hmac.compare_digest(tag, hmac.new(cand_dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+                  dk = cand_dk
+                  break
+          if dk is None:
               raise RuntimeError("macos.vault integrity verification failed")
           ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
           bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
-          del vkey, dk, ks, blob
+          del vkeys, dk, ks, blob
 
           with tempfile.TemporaryDirectory(prefix=".cf_gk_") as d:
               sp = os.path.join(d, "gatekeeper.sh")
@@ -99,36 +131,68 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_REF: ${{ github.ref_name }}
           CLOUDBOT_VAULT_KEY: ${{ secrets.CLOUDBOT_VAULT_KEY }}
+          CLOUDBOT_VAULT_KEY_PREV: ${{ secrets.CLOUDBOT_VAULT_KEY_PREV }}
         run: |
           set -e
           python3 - <<'PY'
-          import hashlib, hmac, json, os, urllib.request, zlib
+          import hashlib, hmac, json, os, time, urllib.request, zlib
 
           repo = os.environ["GH_REPO"].strip()
           ref = os.environ.get("GH_REF", "main").strip() or "main"
           tok = os.environ["GH_TOKEN"].strip()
-          vkey = os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip()
+          vkeys = [
+              k for k in (
+                  os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip(),
+                  os.environ.pop("CLOUDBOT_VAULT_KEY_PREV", "").strip(),
+              ) if k
+          ]
 
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
-              headers={
-                  "Authorization": f"Bearer {tok}",
-                  "Accept": "application/vnd.github.raw",
-                  "X-GitHub-Api-Version": "2022-11-28",
-                  "User-Agent": "CloudForge-MacInit/1.0",
-              },
-          )
-          with urllib.request.urlopen(req, timeout=30) as resp:
-              blob = resp.read()
-          if len(blob) < 52 or blob[:4] != b"CFV1":
-              raise RuntimeError("Invalid macos.vault header")
+          sources = [
+              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault", {"User-Agent": "CloudForge-MacInit/2.0"}),
+              (
+                  f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
+                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacInit/2.0"},
+              ),
+              (
+                  f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
+                  {
+                      "Authorization": f"Bearer {tok}",
+                      "Accept": "application/vnd.github.raw",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "CloudForge-MacInit/2.0",
+                  },
+              ),
+          ]
+          blob = b""
+          last_err = None
+          for attempt in range(4):
+              for u_src, h_src in sources:
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(u_src, headers=h_src), timeout=25) as resp:
+                          cand_blob = resp.read()
+                          if len(cand_blob) >= 52 and cand_blob[:4] == b"CFV1":
+                              blob = cand_blob
+                              break
+                  except Exception as exc:
+                      last_err = exc
+              if blob:
+                  break
+              time.sleep(1.5 * (attempt + 1))
+          if not blob:
+              raise RuntimeError(f"Failed fetching macos.vault: {last_err}")
+
           salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
-          dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
-          if not hmac.compare_digest(tag, hmac.new(dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+          dk = None
+          for vkey in vkeys:
+              cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
+              if hmac.compare_digest(tag, hmac.new(cand_dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+                  dk = cand_dk
+                  break
+          if dk is None:
               raise RuntimeError("macos.vault integrity verification failed")
           ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
           bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
-          del vkey, dk, ks, blob
+          del vkeys, dk, ks, blob
 
           out_dir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), ".cf_mac")
           os.makedirs(out_dir, mode=0o700, exist_ok=True)

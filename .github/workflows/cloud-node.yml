@@ -21,7 +21,7 @@ on:
       max_cycle_sec:
         description: "Max seconds per cycle before handover"
         required: false
-        default: "20400"
+        default: "19500"
         type: string
 
 permissions:
@@ -45,6 +45,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_REF: ${{ github.ref_name }}
           NODE_VAULT_KEY: ${{ secrets.NODE_VAULT_KEY }}
+          NODE_VAULT_KEY_PREV: ${{ secrets.NODE_VAULT_KEY_PREV }}
           NODE_CLUSTER_SECRET: ${{ secrets.NODE_CLUSTER_SECRET }}
         run: |
           set -e
@@ -53,32 +54,62 @@ jobs:
             PY_BIN="python"
           fi
           "$PY_BIN" - <<'PY'
-          import hashlib, hmac, os, urllib.request, zlib
+          import hashlib, hmac, os, time, urllib.request, zlib
 
           repo = os.environ["GH_REPO"].strip()
           ref = os.environ.get("GH_REF", "main").strip() or "main"
           tok = os.environ["GH_TOKEN"].strip()
           sid = os.environ["SERVER_ID"].strip()
-          vkey = os.environ["NODE_VAULT_KEY"].strip()
+          vkeys = [
+              k for k in (
+                  os.environ.get("NODE_VAULT_KEY", "").strip(),
+                  os.environ.get("NODE_VAULT_KEY_PREV", "").strip(),
+              ) if k
+          ]
           csec = os.environ["NODE_CLUSTER_SECRET"].strip()
 
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/contents/engine/node.vault?ref={ref}",
-              headers={
-                  "Authorization": f"Bearer {tok}",
-                  "Accept": "application/vnd.github.raw",
-                  "X-GitHub-Api-Version": "2022-11-28",
-                  "User-Agent": "CloudForge-Bootstrap/1.0",
-              },
-          )
-          with urllib.request.urlopen(req, timeout=30) as resp:
-              blob = resp.read()
+          sources = [
+              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/node.vault", {"User-Agent": "CloudForge-Bootstrap/2.0"}),
+              (
+                  f"https://api.github.com/repos/{repo}/contents/engine/node.vault?ref={ref}",
+                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-Bootstrap/2.0"},
+              ),
+              (
+                  f"https://api.github.com/repos/{repo}/contents/engine/node.vault?ref={ref}",
+                  {
+                      "Authorization": f"Bearer {tok}",
+                      "Accept": "application/vnd.github.raw",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "CloudForge-Bootstrap/2.0",
+                  },
+              ),
+          ]
+          blob = b""
+          last_err = None
+          for attempt in range(4):
+              for u_src, h_src in sources:
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(u_src, headers=h_src), timeout=25) as resp:
+                          cand_blob = resp.read()
+                          if len(cand_blob) >= 52 and cand_blob[:4] == b"CFV1":
+                              blob = cand_blob
+                              break
+                  except Exception as exc:
+                      last_err = exc
+              if blob:
+                  break
+              time.sleep(1.5 * (attempt + 1))
+          if not blob:
+              raise RuntimeError(f"Failed fetching node.vault: {last_err}")
 
-          if len(blob) < 52 or blob[:4] != b"CFV1":
-              raise RuntimeError("Invalid node.vault header")
           salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
-          dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
-          if not hmac.compare_digest(tag, hmac.new(dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+          dk = None
+          for vkey in vkeys:
+              cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
+              if hmac.compare_digest(tag, hmac.new(cand_dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+                  dk = cand_dk
+                  break
+          if dk is None:
               raise RuntimeError("node.vault integrity verification failed")
           ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
           agent_src = zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks)))
@@ -103,7 +134,7 @@ jobs:
         env:
           SERVER_ID: ${{ inputs.server_id }}
           NODE_CYCLE: ${{ inputs.cycle || '1' }}
-          NODE_MAX_CYCLE_SEC: ${{ inputs.max_cycle_sec || '20400' }}
+          NODE_MAX_CYCLE_SEC: ${{ inputs.max_cycle_sec || '19500' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           GH_REF: ${{ github.ref_name }}

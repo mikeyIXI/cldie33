@@ -51,9 +51,6 @@ jobs:
     if: needs.watchdog.outputs.should_start == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    concurrency:
-      group: cloudforge-bot-engine
-      cancel-in-progress: true
     steps:
       - name: Checkout Encrypted Vault
         uses: actions/checkout@v4
@@ -61,12 +58,14 @@ jobs:
       - name: Start CloudForge 24/7 Bot Service
         env:
           CLOUDBOT_VAULT_KEY: ${{ secrets.CLOUDBOT_VAULT_KEY }}
+          CLOUDBOT_VAULT_KEY_PREV: ${{ secrets.CLOUDBOT_VAULT_KEY_PREV }}
           CLOUDBOT_TOKEN: ${{ secrets.CLOUDBOT_TOKEN }}
           CLOUDBOT_OWNER_ID: ${{ secrets.CLOUDBOT_OWNER_ID }}
           CLOUDBOT_DB_KEY: ${{ secrets.CLOUDBOT_DB_KEY }}
           CLOUDBOT_DB_KEY_V2: ${{ secrets.CLOUDBOT_DB_KEY_V2 }}
           NODE_CLUSTER_SECRET: ${{ secrets.NODE_CLUSTER_SECRET }}
           NODE_VAULT_KEY: ${{ secrets.NODE_VAULT_KEY }}
+          NODE_VAULT_KEY_PREV: ${{ secrets.NODE_VAULT_KEY_PREV }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           GH_REF: ${{ github.ref_name }}
@@ -75,18 +74,28 @@ jobs:
           python3 - <<'PY'
           import hashlib, hmac, json, os, shutil, sys, tempfile, zlib
 
-          vkey = os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip()
+          vkeys = [
+              k for k in (
+                  os.environ.pop("CLOUDBOT_VAULT_KEY", "").strip(),
+                  os.environ.pop("CLOUDBOT_VAULT_KEY_PREV", "").strip(),
+              ) if k
+          ]
           with open("engine/core.vault", "rb") as f:
               blob = f.read()
           if len(blob) < 52 or blob[:4] != b"CFV1":
               raise RuntimeError("Invalid core.vault header")
           salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
-          dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
-          if not hmac.compare_digest(tag, hmac.new(dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+          dk = None
+          for cand in vkeys:
+              cand_dk = hashlib.pbkdf2_hmac("sha512", cand.encode("utf-8"), salt, 250_000, dklen=64)
+              if hmac.compare_digest(tag, hmac.new(cand_dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+                  dk = cand_dk
+                  break
+          if dk is None:
               raise RuntimeError("core.vault integrity verification failed")
           ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
           modules = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
-          del vkey, dk, ks, blob
+          del vkeys, dk, ks, blob
 
           shm_base = "/dev/shm" if os.path.isdir("/dev/shm") else None
           pkg_root = tempfile.mkdtemp(prefix=".cf_pkg_", dir=shm_base)
