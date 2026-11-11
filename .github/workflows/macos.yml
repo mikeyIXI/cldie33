@@ -58,48 +58,49 @@ jobs:
           ]
 
           sources = [
-              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault", {"User-Agent": "CloudForge-MacGate/2.0"}),
-              (
-                  f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
-                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacGate/2.0"},
-              ),
               (
                   f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
                   {
                       "Authorization": f"Bearer {tok}",
                       "Accept": "application/vnd.github.raw",
                       "X-GitHub-Api-Version": "2022-11-28",
-                      "User-Agent": "CloudForge-MacGate/2.0",
+                      "User-Agent": "CloudForge-MacGate/2.1",
                   },
               ),
+              (
+                  f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
+                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacGate/2.1"},
+              ),
+              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault", {"User-Agent": "CloudForge-MacGate/2.1"}),
           ]
           blob = b""
+          dk = None
+          salt = b""
+          ct = b""
           last_err = None
           for attempt in range(4):
               for u_src, h_src in sources:
                   try:
                       with urllib.request.urlopen(urllib.request.Request(u_src, headers=h_src), timeout=25) as resp:
                           cand_blob = resp.read()
-                          if len(cand_blob) >= 52 and cand_blob[:4] == b"CFV1":
-                              blob = cand_blob
+                      if len(cand_blob) < 52 or cand_blob[:4] != b"CFV1":
+                          continue
+                      c_salt, c_tag, c_ct = cand_blob[4:20], cand_blob[20:52], cand_blob[52:]
+                      for vkey in vkeys:
+                          cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), c_salt, 250_000, dklen=64)
+                          if hmac.compare_digest(c_tag, hmac.new(cand_dk[32:], b"CFV1" + c_salt + c_ct, hashlib.sha256).digest()):
+                              blob, salt, ct, dk = cand_blob, c_salt, c_ct, cand_dk
                               break
+                      if dk is not None:
+                          break
+                      last_err = "HMAC mismatch"
                   except Exception as exc:
                       last_err = exc
-              if blob:
+              if dk is not None:
                   break
               time.sleep(1.5 * (attempt + 1))
-          if not blob:
-              raise RuntimeError(f"Failed fetching macos.vault: {last_err}")
-
-          salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
-          dk = None
-          for vkey in vkeys:
-              cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
-              if hmac.compare_digest(tag, hmac.new(cand_dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
-                  dk = cand_dk
-                  break
           if dk is None:
-              raise RuntimeError("macos.vault integrity verification failed")
+              raise RuntimeError(f"macos.vault fetch/integrity verification failed: {last_err}")
           ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
           bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
           del vkeys, dk, ks, blob
@@ -148,48 +149,49 @@ jobs:
           ]
 
           sources = [
-              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault", {"User-Agent": "CloudForge-MacInit/2.0"}),
-              (
-                  f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
-                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacInit/2.0"},
-              ),
               (
                   f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
                   {
                       "Authorization": f"Bearer {tok}",
                       "Accept": "application/vnd.github.raw",
                       "X-GitHub-Api-Version": "2022-11-28",
-                      "User-Agent": "CloudForge-MacInit/2.0",
+                      "User-Agent": "CloudForge-MacInit/2.1",
                   },
               ),
+              (
+                  f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
+                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacInit/2.1"},
+              ),
+              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault", {"User-Agent": "CloudForge-MacInit/2.1"}),
           ]
           blob = b""
+          dk = None
+          salt = b""
+          ct = b""
           last_err = None
           for attempt in range(4):
               for u_src, h_src in sources:
                   try:
                       with urllib.request.urlopen(urllib.request.Request(u_src, headers=h_src), timeout=25) as resp:
                           cand_blob = resp.read()
-                          if len(cand_blob) >= 52 and cand_blob[:4] == b"CFV1":
-                              blob = cand_blob
+                      if len(cand_blob) < 52 or cand_blob[:4] != b"CFV1":
+                          continue
+                      c_salt, c_tag, c_ct = cand_blob[4:20], cand_blob[20:52], cand_blob[52:]
+                      for vkey in vkeys:
+                          cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), c_salt, 250_000, dklen=64)
+                          if hmac.compare_digest(c_tag, hmac.new(cand_dk[32:], b"CFV1" + c_salt + c_ct, hashlib.sha256).digest()):
+                              blob, salt, ct, dk = cand_blob, c_salt, c_ct, cand_dk
                               break
+                      if dk is not None:
+                          break
+                      last_err = "HMAC mismatch"
                   except Exception as exc:
                       last_err = exc
-              if blob:
+              if dk is not None:
                   break
               time.sleep(1.5 * (attempt + 1))
-          if not blob:
-              raise RuntimeError(f"Failed fetching macos.vault: {last_err}")
-
-          salt, tag, ct = blob[4:20], blob[20:52], blob[52:]
-          dk = None
-          for vkey in vkeys:
-              cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
-              if hmac.compare_digest(tag, hmac.new(cand_dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
-                  dk = cand_dk
-                  break
           if dk is None:
-              raise RuntimeError("macos.vault integrity verification failed")
+              raise RuntimeError(f"macos.vault fetch/integrity verification failed: {last_err}")
           ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
           bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
           del vkeys, dk, ks, blob
