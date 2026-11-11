@@ -64,19 +64,19 @@ jobs:
                       "Authorization": f"Bearer {tok}",
                       "Accept": "application/vnd.github.raw",
                       "X-GitHub-Api-Version": "2022-11-28",
-                      "User-Agent": "CloudForge-MacGate/2.1",
+                      "User-Agent": "CloudForge-MacGate/2.0",
                   },
               ),
               (
                   f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
-                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacGate/2.1"},
+                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacGate/2.0"},
               ),
-              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault", {"User-Agent": "CloudForge-MacGate/2.1"}),
+              (
+                  f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault?t={int(time.time())}",
+                  {"Cache-Control": "no-cache", "User-Agent": "CloudForge-MacGate/2.0"},
+              ),
           ]
-          blob = b""
-          dk = None
-          salt = b""
-          ct = b""
+          bundle = None
           last_err = None
           for attempt in range(4):
               for u_src, h_src in sources:
@@ -84,26 +84,29 @@ jobs:
                       with urllib.request.urlopen(urllib.request.Request(u_src, headers=h_src), timeout=25) as resp:
                           cand_blob = resp.read()
                       if len(cand_blob) < 52 or cand_blob[:4] != b"CFV1":
+                          last_err = "invalid CFV1 header"
                           continue
-                      c_salt, c_tag, c_ct = cand_blob[4:20], cand_blob[20:52], cand_blob[52:]
+                      salt, tag, ct = cand_blob[4:20], cand_blob[20:52], cand_blob[52:]
+                      dk = None
                       for vkey in vkeys:
-                          cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), c_salt, 250_000, dklen=64)
-                          if hmac.compare_digest(c_tag, hmac.new(cand_dk[32:], b"CFV1" + c_salt + c_ct, hashlib.sha256).digest()):
-                              blob, salt, ct, dk = cand_blob, c_salt, c_ct, cand_dk
+                          cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
+                          if hmac.compare_digest(tag, hmac.new(cand_dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+                              dk = cand_dk
                               break
-                      if dk is not None:
-                          break
-                      last_err = "HMAC mismatch"
+                      if dk is None:
+                          last_err = "macos.vault integrity verification failed"
+                          continue
+                      ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
+                      bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
+                      break
                   except Exception as exc:
                       last_err = exc
-              if dk is not None:
+              if bundle is not None:
                   break
               time.sleep(1.5 * (attempt + 1))
-          if dk is None:
-              raise RuntimeError(f"macos.vault fetch/integrity verification failed: {last_err}")
-          ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
-          bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
-          del vkeys, dk, ks, blob
+          if bundle is None:
+              raise RuntimeError(f"Failed fetching/verifying macos.vault: {last_err}")
+          del vkeys
 
           with tempfile.TemporaryDirectory(prefix=".cf_gk_") as d:
               sp = os.path.join(d, "gatekeeper.sh")
@@ -155,19 +158,19 @@ jobs:
                       "Authorization": f"Bearer {tok}",
                       "Accept": "application/vnd.github.raw",
                       "X-GitHub-Api-Version": "2022-11-28",
-                      "User-Agent": "CloudForge-MacInit/2.1",
+                      "User-Agent": "CloudForge-MacInit/2.0",
                   },
               ),
               (
                   f"https://api.github.com/repos/{repo}/contents/engine/macos.vault?ref={ref}",
-                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacInit/2.1"},
+                  {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CloudForge-MacInit/2.0"},
               ),
-              (f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault", {"User-Agent": "CloudForge-MacInit/2.1"}),
+              (
+                  f"https://raw.githubusercontent.com/{repo}/{ref}/engine/macos.vault?t={int(time.time())}",
+                  {"Cache-Control": "no-cache", "User-Agent": "CloudForge-MacInit/2.0"},
+              ),
           ]
-          blob = b""
-          dk = None
-          salt = b""
-          ct = b""
+          bundle = None
           last_err = None
           for attempt in range(4):
               for u_src, h_src in sources:
@@ -175,26 +178,29 @@ jobs:
                       with urllib.request.urlopen(urllib.request.Request(u_src, headers=h_src), timeout=25) as resp:
                           cand_blob = resp.read()
                       if len(cand_blob) < 52 or cand_blob[:4] != b"CFV1":
+                          last_err = "invalid CFV1 header"
                           continue
-                      c_salt, c_tag, c_ct = cand_blob[4:20], cand_blob[20:52], cand_blob[52:]
+                      salt, tag, ct = cand_blob[4:20], cand_blob[20:52], cand_blob[52:]
+                      dk = None
                       for vkey in vkeys:
-                          cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), c_salt, 250_000, dklen=64)
-                          if hmac.compare_digest(c_tag, hmac.new(cand_dk[32:], b"CFV1" + c_salt + c_ct, hashlib.sha256).digest()):
-                              blob, salt, ct, dk = cand_blob, c_salt, c_ct, cand_dk
+                          cand_dk = hashlib.pbkdf2_hmac("sha512", vkey.encode("utf-8"), salt, 250_000, dklen=64)
+                          if hmac.compare_digest(tag, hmac.new(cand_dk[32:], b"CFV1" + salt + ct, hashlib.sha256).digest()):
+                              dk = cand_dk
                               break
-                      if dk is not None:
-                          break
-                      last_err = "HMAC mismatch"
+                      if dk is None:
+                          last_err = "macos.vault integrity verification failed"
+                          continue
+                      ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
+                      bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
+                      break
                   except Exception as exc:
                       last_err = exc
-              if dk is not None:
+              if bundle is not None:
                   break
               time.sleep(1.5 * (attempt + 1))
-          if dk is None:
-              raise RuntimeError(f"macos.vault fetch/integrity verification failed: {last_err}")
-          ks = hashlib.shake_256(dk[:32] + salt).digest(len(ct))
-          bundle = json.loads(zlib.decompress(bytes(a ^ b for a, b in zip(ct, ks))).decode("utf-8"))
-          del vkeys, dk, ks, blob
+          if bundle is None:
+              raise RuntimeError(f"Failed fetching/verifying macos.vault: {last_err}")
+          del vkeys
 
           out_dir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), ".cf_mac")
           os.makedirs(out_dir, mode=0o700, exist_ok=True)
