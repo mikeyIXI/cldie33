@@ -15,14 +15,10 @@ permissions:
   actions: write
 
 jobs:
-  watchdog:
-    name: Check Active Engine
+  engine:
+    name: CloudForge Telegram Bot
     runs-on: ubuntu-24.04
-    concurrency:
-      group: cloudforge-bot-watchdog
-      cancel-in-progress: true
-    outputs:
-      should_start: ${{ steps.check.outputs.should_start }}
+    timeout-minutes: 360
     steps:
       - name: Check if Bot Engine is already running (with Zombie Heartbeat Recovery)
         id: check
@@ -98,17 +94,12 @@ jobs:
                   f.write("should_start=false\n")
           PY
 
-  engine:
-    name: CloudForge Telegram Bot
-    needs: watchdog
-    if: needs.watchdog.outputs.should_start == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    steps:
       - name: Checkout Encrypted Vault
+        if: steps.check.outputs.should_start == 'true'
         uses: actions/checkout@v4
 
       - name: Start CloudForge 24/7 Bot Service
+        if: steps.check.outputs.should_start == 'true'
         env:
           CLOUDBOT_VAULT_KEY: ${{ secrets.CLOUDBOT_VAULT_KEY }}
           CLOUDBOT_VAULT_KEY_PREV: ${{ secrets.CLOUDBOT_VAULT_KEY_PREV }}
